@@ -3,9 +3,10 @@
 connections.py — Track and set up YouTube / Instagram / TikTok credentials
 on the poster backend (where the worker posts from).
 
-Credentials live on the poster host filesystem:
-  - YouTube:  token.json (+ client_secrets.json for OAuth)
-  - Instagram: instagram_browser/ (Playwright profile)
+Credentials live on the poster host (clients.json preferred):
+  - YouTube:  clients.json youtube.token / youtube.client_secrets
+              (fallback: token.json + client_secrets.json)
+  - Instagram: clients.json authorization_data, or instagram_browser/
   - TikTok:    tiktok_session/ (Playwright profile)
 """
 
@@ -19,11 +20,9 @@ import traceback
 from datetime import datetime, timezone
 from typing import Any
 
-from uploader import load_config, setup_instagram_interactive, setup_tiktok_interactive
 from uploader import (
     _persist_youtube_creds,
     load_config,
-    resolve_config_path,
     save_clients_config,
     setup_instagram_interactive,
     setup_tiktok_interactive,
@@ -94,7 +93,6 @@ def youtube_can_connect(cfg: dict | None = None) -> bool:
 def instagram_connected(cfg: dict | None = None) -> bool:
     cfg = cfg or load_config()
     session_dir, session_file = _instagram_paths(cfg)
-    return _dir_nonempty(session_dir) or _file_nonempty(session_file)
     if _dir_nonempty(session_dir) or _file_nonempty(session_file):
         return True
     ig = cfg.get("instagram", {})
@@ -117,7 +115,7 @@ def get_setup_snapshot() -> dict[str, dict[str, Any]]:
 def get_connections_status() -> dict[str, Any]:
     """Return connected / ready state for each platform (poster host)."""
     cfg = load_config()
-    secrets, token = _youtube_paths(cfg)
+    _, token = _youtube_paths(cfg)
     ig_dir, ig_file = _instagram_paths(cfg)
     tt_dir = _tiktok_path(cfg)
     setups = get_setup_snapshot()
@@ -139,14 +137,16 @@ def get_connections_status() -> dict[str, Any]:
                     "OAuth token saved"
                     if yt_ok
                     else (
-                        "client_secrets.json missing — add Google OAuth desktop credentials"
+                        "client_secrets missing — add Google OAuth desktop credentials"
                         if not youtube_can_connect(cfg)
                         else "Not connected — click Connect to authorize"
                     )
                 ),
-                "token_file": token,
-                "client_secrets_present": os.path.isfile(secrets),
-                "token_file": "clients.json" if isinstance(cfg.get("youtube", {}).get("token"), dict) else token,
+                "token_file": (
+                    "clients.json"
+                    if isinstance(cfg.get("youtube", {}).get("token"), dict)
+                    else token
+                ),
                 "client_secrets_present": youtube_can_connect(cfg),
                 "setup": setups["youtube"],
             },
@@ -180,8 +180,6 @@ def get_connections_status() -> dict[str, Any]:
     }
 
 
-def setup_youtube_interactive(config_path: str = "config.json") -> dict[str, Any]:
-    """Run Google OAuth once and persist token.json for the poster worker."""
 def setup_youtube_interactive(config_path: str = "clients.json") -> dict[str, Any]:
     """Run Google OAuth once and persist token in clients.json (and token.json)."""
     try:
@@ -202,23 +200,20 @@ def setup_youtube_interactive(config_path: str = "clients.json") -> dict[str, An
     secrets, token_file = _youtube_paths(cfg)
     scopes = ["https://www.googleapis.com/auth/youtube.upload"]
 
-    if not os.path.isfile(secrets):
     has_client_secrets_dict = isinstance(yt.get("client_secrets"), dict)
     if not has_client_secrets_dict and not os.path.isfile(secrets):
         return {
             "success": False,
             "error": (
-                f"YouTube client secrets not found ({secrets}).\n"
                 f"YouTube client secrets not found in clients.json or ({secrets}).\n"
                 "1. Google Cloud Console → enable YouTube Data API v3\n"
                 "2. Create OAuth Desktop client\n"
-                "3. Download JSON as client_secrets.json in posting_clips/"
-                "3. Download JSON and save into clients.json (or as client_secrets.json in posting_clips/)"
+                "3. Download JSON and save into clients.json "
+                "(or as client_secrets.json in posting_clips/)"
             ),
         }
 
     creds = None
-    if os.path.exists(token_file):
     if isinstance(yt.get("token"), dict):
         try:
             creds = Credentials.from_authorized_user_info(yt["token"], scopes)
@@ -237,8 +232,6 @@ def setup_youtube_interactive(config_path: str = "clients.json") -> dict[str, An
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
-            with open(token_file, "w", encoding="utf-8") as f:
-                f.write(creds.to_json())
             _persist_youtube_creds(creds, token_file=token_file, config_path=config_path)
             return {"success": True, "message": "YouTube token refreshed.", "token_file": token_file}
         except Exception:
@@ -249,22 +242,14 @@ def setup_youtube_interactive(config_path: str = "clients.json") -> dict[str, An
     print("========================================================")
     print("A browser window will open. Sign in and allow youtube.upload.\n")
 
-    flow = InstalledAppFlow.from_client_secrets_file(secrets, scopes)
     if has_client_secrets_dict:
         flow = InstalledAppFlow.from_client_config(yt["client_secrets"], scopes)
     else:
         flow = InstalledAppFlow.from_client_secrets_file(secrets, scopes)
     creds = flow.run_local_server(port=0)
 
-    with open(token_file, "w", encoding="utf-8") as f:
-        f.write(creds.to_json())
     _persist_youtube_creds(creds, token_file=token_file, config_path=config_path)
 
-    print(f"[OK] YouTube token saved to {token_file}")
-    return {"success": True, "message": f"YouTube connected. Token saved to {token_file}.", "token_file": token_file}
-    print(f"[OK] YouTube token saved to clients.json / {token_file}")
-    return {"success": True, "message": f"YouTube connected. Token saved.", "token_file": token_file}
-    print(f"[OK] YouTube token saved to clients.json")
     print("[OK] YouTube token saved to clients.json")
     return {"success": True, "message": "YouTube connected. Token saved.", "token_file": token_file}
 
@@ -320,8 +305,9 @@ def start_connect(platform: str) -> dict[str, Any]:
         return {
             "success": False,
             "error": (
-                "client_secrets.json not found on the poster server. "
-                "Add Google OAuth desktop credentials to posting_clips/ first."
+                "YouTube client secrets not found on the poster server. "
+                "Add them to clients.json (youtube.client_secrets) or "
+                "client_secrets.json in posting_clips/ first."
             ),
         }
 
