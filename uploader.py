@@ -479,6 +479,80 @@ def _ig_click_role_button(page, name: str, timeout_ms: int = 20000, optional: bo
     return False
 
 
+def _ig_select_original_aspect(page) -> bool:
+    """
+    On Instagram's crop step, pick Original / 9:16 so a full-screen short isn't
+    shrunk into 4:5 (which clips top title text at ~1/5 height).
+    Best-effort: returns False if the crop UI isn't present (e.g. some Reel paths).
+    """
+    # Open the aspect-ratio / crop menu if it isn't already open
+    opened = _ig_click_first(
+        page,
+        [
+            'svg[aria-label="Select crop"]',
+            '[aria-label="Select crop"]',
+            'button[aria-label="Select crop"]',
+            'svg[aria-label="Crop"]',
+            '[aria-label="Crop"]',
+            'button[aria-label="Crop"]',
+            'svg[aria-label="Aspect ratio"]',
+            '[aria-label="Aspect ratio"]',
+        ],
+        timeout_ms=2500,
+    )
+    if opened:
+        page.wait_for_timeout(600)
+
+    # Prefer full original frame, then explicit 9:16
+    selected = _ig_click_first(
+        page,
+        [
+            'span:text-is("Original")',
+            'button:has-text("Original")',
+            '[role="button"]:has-text("Original")',
+            'div[role="button"]:has-text("Original")',
+            'span:text-is("9:16")',
+            'button:has-text("9:16")',
+            '[role="button"]:has-text("9:16")',
+            'div[role="button"]:has-text("9:16")',
+        ],
+        timeout_ms=2500,
+    )
+    if selected:
+        print("  Selected Instagram Original/9:16 crop (keeps full-frame title text).")
+        page.wait_for_timeout(800)
+        return True
+
+    # JS fallback: click any control whose label mentions Original or 9:16
+    try:
+        clicked = page.evaluate(
+            """() => {
+                const labels = ['original', '9:16', '9 / 16'];
+                const nodes = Array.from(document.querySelectorAll(
+                    'button, [role="button"], span, div'
+                ));
+                for (const el of nodes) {
+                    const t = (el.innerText || el.getAttribute('aria-label') || '').trim().toLowerCase();
+                    if (!t || t.length > 24) continue;
+                    if (!labels.some(l => t === l || t.includes(l))) continue;
+                    const target = el.closest('button, [role="button"]') || el;
+                    target.click();
+                    return true;
+                }
+                return false;
+            }"""
+        )
+        if clicked:
+            print("  Selected Instagram Original/9:16 crop (JS fallback).")
+            page.wait_for_timeout(800)
+            return True
+    except Exception:
+        pass
+
+    print("  Instagram crop UI not found or already full-frame — continuing.")
+    return False
+
+
 def _ig_fill_caption(page, caption: str) -> None:
     selectors = [
         'textarea[aria-label^="Write a caption"]',
@@ -741,12 +815,12 @@ def upload_instagram_reel(
                 return {"success": False, "error": "Could not click Instagram 'New post' (+) button."}
             page.wait_for_timeout(1500)
 
-            # Optional: pick Post/Reel from create menu if shown
+            # Prefer Reel so IG keeps 9:16 instead of defaulting to a 4:5 Post crop
             _ig_click_first(page, [
-                'span:text-is("Post")',
-                'div[role="menuitem"]:has-text("Post")',
                 'span:text-is("Reel")',
                 'div[role="menuitem"]:has-text("Reel")',
+                'span:text-is("Post")',
+                'div[role="menuitem"]:has-text("Post")',
             ])
             page.wait_for_timeout(1000)
 
@@ -767,8 +841,9 @@ def upload_instagram_reel(
             _ig_click_role_button(page, "OK", timeout_ms=5000, optional=True)
             page.wait_for_timeout(1000)
 
-            # Crop step → Next (wait longer; Next stays disabled while processing)
+            # Crop step: keep full 9:16 so high title text (e.g. 1/5) stays visible
             print("Stepping through Instagram create flow...")
+            _ig_select_original_aspect(page)
             if not _ig_click_role_button(page, "Next", timeout_ms=90000):
                 _ig_dump_debug(page, "ig_no_next_crop")
                 browser.close()
