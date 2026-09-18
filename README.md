@@ -151,6 +151,9 @@ python uploader.py --setup-tiktok
 | `SUPABASE_SERVICE_ROLE_KEY` | - | Service role secret key |
 | `CLIENTS_JSON_BASE64` | - | Base64-encoded `clients.json` (ideal for remote cloud/Docker backend deployment) |
 | `CLIENTS_JSON` | - | Minified JSON string of `clients.json` |
+| `YOUTUBE_TOKEN_JSON_BASE64` | - | Base64 Google OAuth token dict (auto-writes `clients.json` if missing) |
+| `YOUTUBE_CLIENT_SECRETS_JSON_BASE64` | - | Base64 Google OAuth client secrets dict |
+| `INSTAGRAM_SESSIONID` | - | Instagram `sessionid` cookie (also materializes into `clients.json`) |
 | `ENABLE_BACKGROUND_WORKER` | `true` | Set to `false` to disable polling on API server |
 | `POLL_SECONDS` | `30` | Seconds between queue poll checks |
 | `HOST` | `0.0.0.0` | API bind address |

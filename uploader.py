@@ -23,6 +23,7 @@ import re
 import subprocess
 import sys
 import time
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
@@ -38,8 +39,6 @@ if sys.platform == "win32":
 DEFAULT_HASHTAGS = ["#Shorts", "#DJ", "#ElectronicMusic", "#EDM", "#BoilerRoom", "#Festival", "#DJSet"]
 
 
-def load_config(config_path: str = "config.json") -> dict:
-    """Load configuration from config.json and/or environment variables."""
 def resolve_config_path(config_path: str = "clients.json") -> str:
     """Resolve preferred config path (clients.json > config.json)."""
     if os.path.isfile(config_path):
@@ -67,10 +66,12 @@ def _persist_youtube_creds(creds, token_file: str = "token.json", config_path: s
     """Persist updated OAuth credentials to clients.json and/or token.json."""
     creds_dict = json.loads(creds.to_json()) if hasattr(creds, "to_json") else creds
     cfg_file = resolve_config_path(config_path)
-    if os.path.isfile(cfg_file):
+    if os.path.isfile(cfg_file) or cfg_file.endswith("clients.json"):
         try:
-            with open(cfg_file, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
+            cfg: dict = {}
+            if os.path.isfile(cfg_file):
+                with open(cfg_file, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
             if "youtube" not in cfg:
                 cfg["youtube"] = {}
             cfg["youtube"]["token"] = creds_dict
@@ -90,12 +91,84 @@ def _persist_youtube_creds(creds, token_file: str = "token.json", config_path: s
             pass
 
 
+def _parse_env_json(name: str) -> dict | list | None:
+    """
+    Read JSON from env var `name`, or base64 from `{name}_BASE64`.
+    Returns parsed object or None if unset / invalid.
+    """
+    raw = os.environ.get(name, "").strip()
+    b64 = os.environ.get(f"{name}_BASE64", "").strip()
+    if not raw and b64:
+        try:
+            import base64
+            raw = base64.b64decode(b64).decode("utf-8")
+        except Exception as e:
+            print(f"Warning: Failed to decode {name}_BASE64: {e}")
+            return None
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception as e:
+        print(f"Warning: Failed to parse {name} as JSON: {e}")
+        return None
+
+
+def _materialize_clients_json(config: dict) -> None:
+    """
+    If clients.json is missing but env provided credentials, write one so
+    OAuth refresh / disconnect can persist on disk (cloud-friendly bootstrap).
+    """
+    if os.path.isfile("clients.json"):
+        return
+    yt = config.get("youtube") or {}
+    ig = config.get("instagram") or {}
+    has_yt = isinstance(yt.get("token"), dict) or isinstance(yt.get("client_secrets"), dict)
+    has_ig = bool(ig.get("sessionid")) or isinstance(ig.get("authorization_data"), dict)
+    if not (has_yt or has_ig):
+        return
+    payload = {
+        "youtube": {
+            "enabled": True,
+            "default_privacy": yt.get("default_privacy", "public"),
+        },
+        "instagram": {
+            "enabled": True,
+            "session_file": ig.get("session_file", "instagram_session.json"),
+            "session_dir": ig.get("session_dir", "instagram_browser"),
+        },
+        "tiktok": {
+            "enabled": True,
+            "session_dir": (config.get("tiktok") or {}).get("session_dir", "tiktok_session"),
+        },
+    }
+    if isinstance(yt.get("client_secrets"), dict):
+        payload["youtube"]["client_secrets"] = yt["client_secrets"]
+    if isinstance(yt.get("token"), dict):
+        payload["youtube"]["token"] = yt["token"]
+    if isinstance(ig.get("authorization_data"), dict):
+        payload["instagram"]["authorization_data"] = ig["authorization_data"]
+    elif ig.get("sessionid"):
+        payload["instagram"]["authorization_data"] = {"sessionid": ig["sessionid"]}
+        payload["instagram"]["sessionid"] = ig["sessionid"]
+    try:
+        with open("clients.json", "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        print("[config] Wrote clients.json from environment credentials.")
+    except Exception as e:
+        print(f"Warning: Could not materialize clients.json: {e}")
+
+
 def load_config(config_path: str = "clients.json") -> dict:
-    """Load configuration from clients.json, .env (CLIENTS_JSON / CLIENTS_JSON_BASE64), or fallback files."""
-    # Ensure .env is loaded first if python-dotenv is available
+    """Load configuration from clients.json, .env credential vars, or fallback files."""
     try:
         from dotenv import load_dotenv
-        load_dotenv()
+        # Always load posting_clips/.env even if cwd differs (cloud / service wrappers)
+        env_path = Path(__file__).resolve().parent / ".env"
+        if env_path.is_file():
+            load_dotenv(dotenv_path=env_path, override=False)
+        else:
+            load_dotenv(override=False)
     except ImportError:
         pass
 
@@ -110,7 +183,7 @@ def load_config(config_path: str = "clients.json") -> dict:
             "enabled": True,
             "client_secrets_file": yt_secrets,
             "token_file": os.environ.get("YOUTUBE_TOKEN_FILE", "token.json"),
-            "default_privacy": "public",
+            "default_privacy": os.environ.get("YOUTUBE_PRIVACY", "public"),
         },
         "instagram": {
             "enabled": True,
@@ -118,7 +191,6 @@ def load_config(config_path: str = "clients.json") -> dict:
             "password": os.environ.get("INSTAGRAM_PASSWORD", ""),
             "sessionid": os.environ.get("INSTAGRAM_SESSIONID", ""),
             "session_file": os.environ.get("INSTAGRAM_SESSION_FILE", "instagram_session.json"),
-            # Browser profile used for Playwright uploads (instagrapi/CAA is unreliable)
             "session_dir": os.environ.get("INSTAGRAM_SESSION_DIR", "instagram_browser"),
         },
         "tiktok": {
@@ -127,36 +199,23 @@ def load_config(config_path: str = "clients.json") -> dict:
         },
     }
 
-    # 1. Check if raw JSON or Base64 is provided in environment variables (ideal for cloud / Docker deployment)
-    env_clients_json = os.environ.get("CLIENTS_JSON", "").strip()
-    env_clients_b64 = os.environ.get("CLIENTS_JSON_BASE64", "").strip()
-    if not env_clients_json and env_clients_b64:
-        try:
-            import base64
-            env_clients_json = base64.b64decode(env_clients_b64).decode("utf-8")
-        except Exception as e:
-            print(f"Warning: Failed to decode CLIENTS_JSON_BASE64: {e}")
+    # 1) Full clients blob (cloud-friendly): CLIENTS_JSON or CLIENTS_JSON_BASE64
+    env_clients = _parse_env_json("CLIENTS_JSON")
+    if isinstance(env_clients, dict):
+        for section, values in env_clients.items():
+            if section in config and isinstance(values, dict):
+                config[section].update(values)
+            elif section not in config:
+                config[section] = values
+        if not os.path.isfile("clients.json"):
+            try:
+                with open("clients.json", "w", encoding="utf-8") as f:
+                    json.dump(env_clients, f, indent=2)
+                print("[config] Wrote clients.json from CLIENTS_JSON env.")
+            except Exception:
+                pass
 
-    if env_clients_json:
-        try:
-            env_cfg = json.loads(env_clients_json)
-            for section, values in env_cfg.items():
-                if section in config and isinstance(values, dict):
-                    config[section].update(values)
-                elif section not in config:
-                    config[section] = values
-
-            # Auto-write clients.json on server disk if not already present
-            if not os.path.isfile("clients.json"):
-                try:
-                    with open("clients.json", "w", encoding="utf-8") as f:
-                        json.dump(env_cfg, f, indent=2)
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"Warning: Failed to parse CLIENTS_JSON from environment: {e}")
-
-    # 2. Otherwise load from disk file if present
+    # 2) Otherwise load from disk
     elif actual_path and os.path.isfile(actual_path):
         try:
             with open(actual_path, "r", encoding="utf-8") as f:
@@ -169,32 +228,37 @@ def load_config(config_path: str = "clients.json") -> dict:
         except Exception as e:
             print(f"Warning: Failed to parse {actual_path}: {e}")
 
-    # If instagram has authorization_data in config, extract sessionid if not explicitly set
-    if "instagram" in config and isinstance(config["instagram"], dict):
-        auth_data = config["instagram"].get("authorization_data")
-        if isinstance(auth_data, dict) and not config["instagram"].get("sessionid"):
-            config["instagram"]["sessionid"] = auth_data.get("sessionid", "")
+    # 3) Discrete YouTube env keys (no need to ship clients.json)
+    #    YOUTUBE_CLIENT_SECRETS_JSON / YOUTUBE_CLIENT_SECRETS_JSON_BASE64
+    #    YOUTUBE_TOKEN_JSON / YOUTUBE_TOKEN_JSON_BASE64
+    yt_secrets_obj = _parse_env_json("YOUTUBE_CLIENT_SECRETS_JSON")
+    if isinstance(yt_secrets_obj, dict):
+        config["youtube"]["client_secrets"] = yt_secrets_obj
 
-    # If python-dotenv is available, also load .env
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-        if os.environ.get("INSTAGRAM_USERNAME"):
-            config["instagram"]["username"] = os.environ["INSTAGRAM_USERNAME"]
-        if os.environ.get("INSTAGRAM_PASSWORD"):
-            config["instagram"]["password"] = os.environ["INSTAGRAM_PASSWORD"]
-        if os.environ.get("INSTAGRAM_SESSIONID"):
-            config["instagram"]["sessionid"] = os.environ["INSTAGRAM_SESSIONID"]
-    except ImportError:
-        pass
-    # Environment variable overrides
+    yt_token_obj = _parse_env_json("YOUTUBE_TOKEN_JSON")
+    if isinstance(yt_token_obj, dict):
+        config["youtube"]["token"] = yt_token_obj
+
+    # Instagram session cookie from env
     if os.environ.get("INSTAGRAM_USERNAME"):
         config["instagram"]["username"] = os.environ["INSTAGRAM_USERNAME"]
     if os.environ.get("INSTAGRAM_PASSWORD"):
         config["instagram"]["password"] = os.environ["INSTAGRAM_PASSWORD"]
     if os.environ.get("INSTAGRAM_SESSIONID"):
-        config["instagram"]["sessionid"] = os.environ["INSTAGRAM_SESSIONID"]
+        sid = os.environ["INSTAGRAM_SESSIONID"]
+        config["instagram"]["sessionid"] = sid
+        auth = config["instagram"].get("authorization_data")
+        if not isinstance(auth, dict):
+            config["instagram"]["authorization_data"] = {"sessionid": sid}
+        else:
+            auth.setdefault("sessionid", sid)
 
+    # Pull sessionid out of authorization_data if only that is set
+    auth_data = config["instagram"].get("authorization_data")
+    if isinstance(auth_data, dict) and not config["instagram"].get("sessionid"):
+        config["instagram"]["sessionid"] = auth_data.get("sessionid", "")
+
+    _materialize_clients_json(config)
     return config
 
 
