@@ -120,10 +120,13 @@ Permissions for auto-posting are stored on the poster machine:
 | TikTok | `tiktok_session/` Playwright profile |
 | YouTube | `clients.json` (under `youtube.token` & `youtube.client_secrets`, or fallback `token.json` / `client_secrets.json`) |
 | Instagram | `clients.json` (`authorization_data`) & `instagram_browser/` Playwright profile |
+| YouTube | `clients.json` (under `youtube.token` & `youtube.client_secrets`) or `CLIENTS_JSON_BASE64` |
+| Instagram | `clients.json` (`authorization_data.sessionid`) & `instagram_browser/` Playwright profile |
 | TikTok | `tiktok_session/` Playwright profile (configured in `clients.json`) |
 
 - **Status**: `GET /api/connections`
 - **Connect**: `POST /api/connections/{youtube\|instagram\|tiktok}/connect`  
+- **Connect**: `POST /api/connections/{youtube|instagram|tiktok}/connect`  
   Opens a browser **on this server** for login. Poll status until `connected: true`.
 - **Disconnect**: `POST /api/connections/{platform}/disconnect`
 
@@ -146,6 +149,8 @@ python uploader.py --setup-tiktok
 |---|---|---|
 | `SUPABASE_URL` | - | Supabase project URL |
 | `SUPABASE_SERVICE_ROLE_KEY` | - | Service role secret key |
+| `CLIENTS_JSON_BASE64` | - | Base64-encoded `clients.json` (ideal for remote cloud/Docker backend deployment) |
+| `CLIENTS_JSON` | - | Minified JSON string of `clients.json` |
 | `ENABLE_BACKGROUND_WORKER` | `true` | Set to `false` to disable polling on API server |
 | `POLL_SECONDS` | `30` | Seconds between queue poll checks |
 | `HOST` | `0.0.0.0` | API bind address |

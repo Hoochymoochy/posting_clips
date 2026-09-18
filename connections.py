@@ -265,6 +265,7 @@ def setup_youtube_interactive(config_path: str = "clients.json") -> dict[str, An
     print(f"[OK] YouTube token saved to clients.json / {token_file}")
     return {"success": True, "message": f"YouTube connected. Token saved.", "token_file": token_file}
     print(f"[OK] YouTube token saved to clients.json")
+    print("[OK] YouTube token saved to clients.json")
     return {"success": True, "message": "YouTube connected. Token saved.", "token_file": token_file}
 
 

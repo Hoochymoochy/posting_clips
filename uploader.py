@@ -79,7 +79,6 @@ def _persist_youtube_creds(creds, token_file: str = "token.json", config_path: s
         except Exception as e:
             print(f"Warning: Could not update {cfg_file} with YouTube token: {e}")
 
-    if token_file:
     if token_file and (os.path.isfile(token_file) or not os.path.isfile(cfg_file)):
         try:
             with open(token_file, "w", encoding="utf-8") as f:
@@ -92,7 +91,14 @@ def _persist_youtube_creds(creds, token_file: str = "token.json", config_path: s
 
 
 def load_config(config_path: str = "clients.json") -> dict:
-    """Load configuration from clients.json / config.json and/or environment variables."""
+    """Load configuration from clients.json, .env (CLIENTS_JSON / CLIENTS_JSON_BASE64), or fallback files."""
+    # Ensure .env is loaded first if python-dotenv is available
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+
     actual_path = resolve_config_path(config_path)
 
     yt_secrets = os.environ.get("YOUTUBE_CLIENT_SECRETS", "client_secrets.json")
@@ -121,11 +127,38 @@ def load_config(config_path: str = "clients.json") -> dict:
         },
     }
 
-    # If config file exists, merge it
-    if config_path and os.path.isfile(config_path):
-    if actual_path and os.path.isfile(actual_path):
+    # 1. Check if raw JSON or Base64 is provided in environment variables (ideal for cloud / Docker deployment)
+    env_clients_json = os.environ.get("CLIENTS_JSON", "").strip()
+    env_clients_b64 = os.environ.get("CLIENTS_JSON_BASE64", "").strip()
+    if not env_clients_json and env_clients_b64:
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
+            import base64
+            env_clients_json = base64.b64decode(env_clients_b64).decode("utf-8")
+        except Exception as e:
+            print(f"Warning: Failed to decode CLIENTS_JSON_BASE64: {e}")
+
+    if env_clients_json:
+        try:
+            env_cfg = json.loads(env_clients_json)
+            for section, values in env_cfg.items():
+                if section in config and isinstance(values, dict):
+                    config[section].update(values)
+                elif section not in config:
+                    config[section] = values
+
+            # Auto-write clients.json on server disk if not already present
+            if not os.path.isfile("clients.json"):
+                try:
+                    with open("clients.json", "w", encoding="utf-8") as f:
+                        json.dump(env_cfg, f, indent=2)
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"Warning: Failed to parse CLIENTS_JSON from environment: {e}")
+
+    # 2. Otherwise load from disk file if present
+    elif actual_path and os.path.isfile(actual_path):
+        try:
             with open(actual_path, "r", encoding="utf-8") as f:
                 user_cfg = json.load(f)
                 for section, values in user_cfg.items():
@@ -134,7 +167,6 @@ def load_config(config_path: str = "clients.json") -> dict:
                     elif section not in config:
                         config[section] = values
         except Exception as e:
-            print(f"Warning: Failed to parse config.json: {e}")
             print(f"Warning: Failed to parse {actual_path}: {e}")
 
     # If instagram has authorization_data in config, extract sessionid if not explicitly set
@@ -155,6 +187,13 @@ def load_config(config_path: str = "clients.json") -> dict:
             config["instagram"]["sessionid"] = os.environ["INSTAGRAM_SESSIONID"]
     except ImportError:
         pass
+    # Environment variable overrides
+    if os.environ.get("INSTAGRAM_USERNAME"):
+        config["instagram"]["username"] = os.environ["INSTAGRAM_USERNAME"]
+    if os.environ.get("INSTAGRAM_PASSWORD"):
+        config["instagram"]["password"] = os.environ["INSTAGRAM_PASSWORD"]
+    if os.environ.get("INSTAGRAM_SESSIONID"):
+        config["instagram"]["sessionid"] = os.environ["INSTAGRAM_SESSIONID"]
 
     return config
 
@@ -279,7 +318,6 @@ def upload_youtube_short(
     scopes = ["https://www.googleapis.com/auth/youtube.upload"]
     creds = None
 
-    if os.path.exists(token_file):
     if token_data and isinstance(token_data, dict):
         try:
             creds = Credentials.from_authorized_user_info(token_data, scopes)
@@ -626,14 +664,16 @@ def upload_instagram_reel(
     abs_video = os.path.abspath(video_path)
     abs_session = os.path.abspath(session_dir)
 
-    if not os.path.isdir(abs_session) or not os.listdir(abs_session):
+    has_session_files = os.path.isdir(abs_session) and bool(os.listdir(abs_session))
+    if not has_session_files and not sessionid:
         return {
             "success": False,
             "error": (
-                f"Instagram browser session '{session_dir}' not found.\n"
+                f"Instagram browser session '{session_dir}' not found and no sessionid provided.\n"
                 f"{_instagram_setup_help(session_dir)}"
             ),
         }
+    os.makedirs(abs_session, exist_ok=True)
 
     print("Launching Instagram uploader session...")
     try:
@@ -645,6 +685,32 @@ def upload_instagram_reel(
                 viewport={"width": 1280, "height": 900},
                 locale="en-US",
             )
+
+            if sessionid:
+                try:
+                    ds_user_id = sessionid.split("%3A")[0].split(":")[0]
+                    cookies_to_add = [
+                        {
+                            "name": "sessionid",
+                            "value": sessionid,
+                            "domain": ".instagram.com",
+                            "path": "/",
+                            "secure": True,
+                            "httpOnly": True,
+                        }
+                    ]
+                    if ds_user_id and ds_user_id.isdigit():
+                        cookies_to_add.append({
+                            "name": "ds_user_id",
+                            "value": ds_user_id,
+                            "domain": ".instagram.com",
+                            "path": "/",
+                            "secure": True,
+                        })
+                    browser.add_cookies(cookies_to_add)
+                except Exception as ce:
+                    print(f"Warning: Could not inject Instagram session cookie: {ce}")
+
             page = browser.new_page()
 
             page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=60000)
@@ -1355,7 +1421,6 @@ def post_to_all(
     caption: str = "",
     tags: list[str] | None = None,
     platforms: list[str] | str = "all",
-    config_path: str = "config.json",
     config_path: str = "clients.json",
     dry_run: bool = False,
     privacy: str = "public",
@@ -1572,13 +1637,10 @@ def run_setup_wizard():
     if do_tt == "y":
         setup_tiktok_interactive(cfg["tiktok"].get("session_dir", "tiktok_session"))
 
-    # Save to config.json
-    with open("config.json", "w", encoding="utf-8") as f:
     # Save to clients.json (or config.json if already present)
     target_config = "clients.json" if os.path.isfile("clients.json") or not os.path.isfile("config.json") else "config.json"
     with open(target_config, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
-    print("\n[OK] Configuration saved to config.json! (Protected by .gitignore)")
     print(f"\n[OK] Configuration saved to {target_config}! (Protected by .gitignore)")
 
 
