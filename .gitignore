@@ -1,0 +1,16 @@
+.env
+clients.json
+config.json
+client_secrets.json
+client_secrets.json.json
+token.json
+instagram_session.json
+instagram_browser/
+tiktok_session/
+__pycache__/
+*.pyc
+*.log
+.venv/
+posted/
+venv/
+clips/
