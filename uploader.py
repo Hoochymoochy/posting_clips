@@ -1793,7 +1793,6 @@ def main():
     p.add_argument("--tags", default="", help="Comma-separated hashtags (e.g. 'Shorts,DJ,EDM')")
     p.add_argument("--platforms", default="all", help="Target platforms: 'all', or comma-separated 'youtube,instagram,tiktok'")
     p.add_argument("--privacy", default="public", choices=["public", "unlisted", "private"], help="Privacy status (default: public)")
-    p.add_argument("--config", default="config.json", help="Path to credentials config.json (default: config.json)")
     p.add_argument("--config", default="clients.json", help="Path to credentials clients.json (default: clients.json)")
     p.add_argument("--dry-run", action="store_true", help="Simulate upload without making live API calls")
     p.add_argument("--setup", action="store_true", help="Run interactive setup wizard to configure credentials")
