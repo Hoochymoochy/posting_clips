@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import re
+import urllib.parse
 from datetime import datetime, timezone
 from typing import Any
 
@@ -137,6 +138,29 @@ def get_clip_by_id(clip_id: str) -> dict[str, Any] | None:
     return None
 
 
+def _extract_youtube_video_id(url: str) -> str | None:
+    if not url:
+        return None
+    raw = str(url).strip()
+    try:
+        parsed = urllib.parse.urlparse(raw if "://" in raw else f"https://{raw}")
+        host = (parsed.netloc or "").lower().replace("www.", "")
+        path = parsed.path or ""
+        qs = urllib.parse.parse_qs(parsed.query or "")
+        if host in ("youtube.com", "m.youtube.com", "music.youtube.com"):
+            if qs.get("v"):
+                return qs["v"][0]
+            m = re.match(r"^/(shorts|embed|live)/([A-Za-z0-9_-]{6,})", path)
+            if m:
+                return m.group(2)
+        if host == "youtu.be":
+            vid = path.lstrip("/").split("/")[0]
+            return vid or None
+    except Exception:
+        return None
+    return None
+
+
 def register_clip(
     *,
     clip_id: str | None = None,
@@ -155,8 +179,10 @@ def register_clip(
     """
     client = get_supabase()
 
+    video_id = _extract_youtube_video_id(youtube_url)
     row: dict[str, Any] = {
         "youtube_url": youtube_url or "https://youtube.com/shorts/local_upload",
+        "youtube_video_id": video_id,
         "title": title or None,
         "caption": (caption or "").strip() or None,
         "tags": tags or None,
