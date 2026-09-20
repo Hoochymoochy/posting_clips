@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -58,6 +59,35 @@ def get_clip_folder(clip_id: str | None) -> Path | None:
     if not clip_id:
         return None
     return get_clips_dir() / str(clip_id).strip()
+
+
+def _safe_clip_id(clip_id: str) -> str:
+    clean = (clip_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", clean):
+        raise ValueError(f"Invalid clip id: {clip_id!r}")
+    return clean
+
+
+def delete_clip_files(clip_id: str) -> dict[str, Any]:
+    """Remove clips/{id}/ from local storage if it exists."""
+    import shutil
+
+    clean = _safe_clip_id(clip_id)
+    folder = get_clips_dir() / clean
+    if not folder.is_dir():
+        return {
+            "success": True,
+            "id": clean,
+            "deleted": False,
+            "message": "No local files for this clip.",
+        }
+    shutil.rmtree(folder)
+    return {
+        "success": True,
+        "id": clean,
+        "deleted": True,
+        "folder": str(folder),
+    }
 
 
 def load_clip_metadata(clip_id: str | None) -> dict[str, Any]:

@@ -12,8 +12,9 @@ Features:
      - Uploads to YouTube Shorts, Instagram Reels, and TikTok
   3. Status & Health endpoints:
      - GET /health
-     - GET /api/clips
-     - GET /api/clips/{id}
+      - GET /api/clips
+      - GET /api/clips/{id}
+      - DELETE /api/clips/{id}
      - GET /api/connections
      - POST /api/connections/{platform}/connect
      - POST /api/connections/{platform}/disconnect
@@ -176,6 +177,8 @@ async def _save_clip_files(
                 print("  [WARN] Supabase not configured; clip video saved locally only.")
         except Exception as e:
             print(f"  [WARN] Could not register clip in Supabase: {e}")
+
+    print("  [INFO] Clip received:", clip_id, "->", dest_video_path, f"({bytes_written} bytes)")
 
     return {
         "success": True,
@@ -342,6 +345,20 @@ def list_clips():
         "total": len(items),
         "clips": items,
     }
+
+
+@app.delete("/api/clips/{id}", tags=["Clips"])
+@app.delete("/clips/{id}", tags=["Clips"])
+def delete_clip_files_route(id: str):
+    """Remove clips/{id}/ from local disk. Does not touch Supabase metadata."""
+    from worker import delete_clip_files
+
+    try:
+        return delete_clip_files(id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Could not delete clip files: {e}")
 
 
 @app.post("/api/worker/poll-now", tags=["Worker"])

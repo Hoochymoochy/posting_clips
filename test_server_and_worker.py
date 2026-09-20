@@ -89,6 +89,15 @@ class TestServerAndWorker(unittest.TestCase):
         self.assertIsNotNone(resolved_path)
         self.assertEqual(Path(resolved_path).resolve(), video_file.resolve())
 
+        # 6. Delete stored files
+        del_res = self.client.delete(f"/api/clips/{clip_id}")
+        self.assertEqual(del_res.status_code, 200, del_res.text)
+        del_data = del_res.json()
+        self.assertTrue(del_data["success"])
+        self.assertTrue(del_data["deleted"])
+        self.assertFalse(target_folder.is_dir())
+        self.assertIsNone(worker.resolve_video_path(None, clip_id=clip_id))
+
 
 if __name__ == "__main__":
     unittest.main()
