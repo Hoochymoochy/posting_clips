@@ -232,6 +232,12 @@ def register_clip(
     }
 
 
+# Terminal statuses — clip can be marked posted once every channel is one of these
+TERMINAL_STATUSES = frozenset({"success", "failed", "uncertain"})
+# Statuses that must never be auto-retried (anti double-upload)
+NO_RETRY_STATUSES = frozenset({"success", "uncertain", "processing"})
+
+
 def update_channel(
     channel_id: str,
     *,
@@ -246,9 +252,69 @@ def update_channel(
         payload["error_message"] = None
         if post_url:
             payload["post_url"] = post_url
-    elif status == "failed":
-        payload["error_message"] = (error_message or "Unknown error")[:2000]
-    client.table("channels").update(payload).eq("id", channel_id).execute()
+    elif status in ("failed", "uncertain"):
+        msg = error_message or "Unknown error"
+        if status == "uncertain" and not msg.upper().startswith("[UNCERTAIN]"):
+            msg = f"[UNCERTAIN] {msg}"
+        payload["error_message"] = msg[:2000]
+        if post_url:
+            payload["post_url"] = post_url
+    elif status == "pending":
+        payload["error_message"] = None
+
+    try:
+        client.table("channels").update(payload).eq("id", channel_id).execute()
+    except Exception as e:
+        # Some projects constrain status to pending|success|failed only
+        err = str(e).lower()
+        if status in ("uncertain", "processing") and (
+            "check" in err or "constraint" in err or "invalid" in err or "enum" in err
+        ):
+            fallback = "failed" if status == "uncertain" else "pending"
+            payload["status"] = fallback
+            if status == "uncertain":
+                payload["error_message"] = (payload.get("error_message") or "[UNCERTAIN]")[:2000]
+            print(f"  [WARN] status={status!r} rejected by DB; wrote {fallback!r} instead ({e})")
+            client.table("channels").update(payload).eq("id", channel_id).execute()
+        else:
+            raise
+
+
+def claim_channel(channel_id: str, *, from_statuses: list[str] | None = None) -> bool:
+    """
+    Best-effort claim: move channel to 'processing' so concurrent workers skip it.
+    Falls back to a local lock if the DB rejects the processing status.
+    """
+    from retry_state import try_local_claim
+
+    client = get_supabase()
+    allowed = from_statuses or ["pending", "failed"]
+    try:
+        res = (
+            client.table("channels")
+            .update({"status": "processing"})
+            .eq("id", channel_id)
+            .in_("status", allowed)
+            .execute()
+        )
+        if res.data:
+            return True
+        # Empty data can mean 0 rows matched (already claimed) OR no RETURNING —
+        # verify current status.
+        check = (
+            client.table("channels")
+            .select("id, status")
+            .eq("id", channel_id)
+            .limit(1)
+            .execute()
+        )
+        row = (check.data or [None])[0]
+        if row and (row.get("status") or "").lower() == "processing":
+            return True
+        return False
+    except Exception as e:
+        print(f"  [WARN] DB claim failed ({e}); using local claim lock.")
+        return try_local_claim(channel_id)
 
 
 def mark_clip_posted(clip_id: str, posted: bool = True) -> None:
@@ -259,3 +325,57 @@ def mark_clip_posted(clip_id: str, posted: bool = True) -> None:
 def pending_channels(clip: dict[str, Any]) -> list[dict[str, Any]]:
     channels = clip.get("channels") or []
     return [c for c in channels if c.get("status") == "pending"]
+
+
+def actionable_channels(clip: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Channels the worker may act on now:
+      - pending (first try or reset for retry)
+      - failed that are still retryable (checked via retry_state)
+      - processing that appear stuck (reset candidate)
+    Never includes success / uncertain.
+    """
+    from retry_state import is_retryable, is_stuck_processing
+
+    out: list[dict[str, Any]] = []
+    for ch in clip.get("channels") or []:
+        status = (ch.get("status") or "").lower()
+        cid = str(ch.get("id") or "")
+        if not cid:
+            continue
+        if status == "pending":
+            out.append(ch)
+        elif status == "failed" and is_retryable(cid, status):
+            out.append(ch)
+        elif status == "processing" and is_stuck_processing(cid, status):
+            out.append(ch)
+    return out
+
+
+def all_channels_terminal(clip: dict[str, Any]) -> bool:
+    """
+    True when no channel still needs work.
+    Failed channels that still have retry budget are NOT terminal.
+    """
+    from retry_state import has_scheduled_retry, is_retryable
+
+    channels = clip.get("channels") or []
+    if not channels:
+        return True
+    for c in channels:
+        status = (c.get("status") or "").lower()
+        cid = str(c.get("id") or "")
+        if status in ("pending", "processing"):
+            return False
+        if status == "failed" and cid and (
+            is_retryable(cid, "failed") or has_scheduled_retry(cid, "failed")
+        ):
+            return False
+        if status not in TERMINAL_STATUSES:
+            return False
+    return True
+
+
+def refresh_clip_channels(clip_id: str) -> dict[str, Any] | None:
+    """Re-fetch clip with channels after status updates."""
+    return get_clip_by_id(clip_id)

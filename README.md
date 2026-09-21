@@ -160,3 +160,22 @@ python uploader.py --setup-tiktok
 | `PORT` | `8000` | API bind port |
 | `DRY_RUN` | `false` | If `true`, validates without live social uploads |
 | `YOUTUBE_PRIVACY` | `public` | Default YouTube privacy (`public`, `unlisted`, `private`) |
+| `DISCORD_WEBHOOK_URL` | - | Discord webhook for auth/retry/ops alerts |
+| `UPLOAD_MAX_ATTEMPTS` | `3` | Max transient upload retries per platform channel |
+| `UPLOAD_RETRY_BACKOFF` | `60,300,900` | Seconds between retry attempts |
+| `STORAGE_WARN_PERCENT` | `85` | Disk usage % that triggers a Discord warning |
+
+### Alerts & safe retries
+
+| Event | Alert |
+| --- | --- |
+| One temporary upload failure | Log only |
+| Three consecutive failures | Discord warning |
+| Authentication expired | Discord immediately |
+| Worker stops responding | Critical alert |
+| Storage exceeds 85% | Warning |
+| Supabase unavailable repeatedly | Critical alert |
+| Job stuck processing | Warning |
+| Unknown publishing outcome | Requires attention (no auto-retry) |
+
+Retries only run for **transient** failures. Auth expiry and **uncertain** publishes (Share/Post clicked but unconfirmed) never auto-retry, so the same clip cannot be double-posted. Channels are claimed as `processing` before upload; `clips.posted` is set only when every channel is terminal.

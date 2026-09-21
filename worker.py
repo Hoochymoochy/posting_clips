@@ -173,8 +173,38 @@ def resolve_video_path(storage_url: str | None, clip_id: str | None = None) -> s
     return None
 
 
+def _maybe_mark_clip_done(clip_id: str) -> None:
+    """Mark clip posted only when every channel is in a terminal status."""
+    from db import all_channels_terminal, mark_clip_posted, refresh_clip_channels
+
+    fresh = refresh_clip_channels(clip_id)
+    if not fresh:
+        return
+    if all_channels_terminal(fresh):
+        mark_clip_posted(clip_id, True)
+        print(f"  Clip {clip_id} fully terminal — marked posted.")
+    else:
+        print(f"  Clip {clip_id} still has open channels — leaving posted=false for retry.")
+
+
 def process_clip(clip: dict, *, dry_run: bool, headless: bool, privacy: str) -> None:
-    from db import mark_clip_posted, pending_channels, update_channel
+    import time as _time
+
+    from alerts import (
+        EVENT_JOB_STUCK,
+        EVENT_TEMP_FAILURE,
+        EVENT_THREE_FAILURES,
+        alert_for_outcome,
+        emit,
+    )
+    from db import actionable_channels, claim_channel, update_channel
+    from retry_state import (
+        MAX_ATTEMPTS,
+        begin_attempt,
+        finish_attempt,
+        get_attempts,
+        is_stuck_processing,
+    )
     from uploader import post_to_all
 
     clip_id = str(clip["id"])
@@ -197,10 +227,45 @@ def process_clip(clip: dict, *, dry_run: bool, headless: bool, privacy: str) -> 
     print(f"   storage_url:  {storage_url}")
     print("=" * 60)
 
-    channels = pending_channels(clip)
+    channels = actionable_channels(clip)
     if not channels:
-        print("  No pending channels — marking clip posted.")
-        mark_clip_posted(clip_id, True)
+        print("  No actionable channels.")
+        _maybe_mark_clip_done(clip_id)
+        return
+
+    # Recover stuck processing rows before claiming
+    still_actionable: list[dict] = []
+    for ch in list(channels):
+        if (ch.get("status") or "").lower() == "processing" and is_stuck_processing(
+            str(ch["id"]), "processing"
+        ):
+            emit(
+                EVENT_JOB_STUCK,
+                detail=(
+                    "Channel stuck in processing > threshold. "
+                    "Marked uncertain — verify the account before any manual retry "
+                    "(Post/Share may already have been clicked)."
+                ),
+                clip_id=clip_id,
+                platform=str(ch.get("platform")),
+            )
+            # Conservative: do not auto-retry after a stuck in-flight upload
+            update_channel(
+                ch["id"],
+                status="uncertain",
+                error_message=(
+                    "Reset after stuck processing — verify account before retrying. "
+                    "Auto-retry disabled to prevent double-posting."
+                ),
+            )
+            finish_attempt(str(ch["id"]), kind="uncertain", share_clicked=True)
+            ch["status"] = "uncertain"
+            continue
+        still_actionable.append(ch)
+    channels = still_actionable
+    if not channels:
+        print("  No actionable channels after stuck recovery.")
+        _maybe_mark_clip_done(clip_id)
         return
 
     video_path = resolve_video_path(storage_url, clip_id=clip_id)
@@ -211,12 +276,48 @@ def process_clip(clip: dict, *, dry_run: bool, headless: bool, privacy: str) -> 
         )
         print(f"  [FAIL] {err}")
         for ch in channels:
-            update_channel(ch["id"], status="failed", error_message=err)
+            cid = str(ch["id"])
+            attempt = begin_attempt(cid)
+            update_channel(cid, status="failed", error_message=err)
+            finish_attempt(cid, kind="transient")
+            if attempt >= MAX_ATTEMPTS:
+                emit(
+                    EVENT_THREE_FAILURES,
+                    detail=err,
+                    clip_id=clip_id,
+                    platform=str(ch.get("platform")),
+                )
+            else:
+                emit(
+                    EVENT_TEMP_FAILURE,
+                    detail=err,
+                    clip_id=clip_id,
+                    platform=str(ch.get("platform")),
+                )
+        _maybe_mark_clip_done(clip_id)
         return
 
     print(f"  Using video file: {video_path}")
-    platforms = [c["platform"] for c in channels]
-    platform_to_channel = {c["platform"]: c for c in channels}
+
+    # Claim each channel before any upload (anti concurrent double-post)
+    claimed: list[dict] = []
+    for ch in channels:
+        cid = str(ch["id"])
+        prior = (ch.get("status") or "pending").lower()
+        from_statuses = ["pending", "failed"] if prior != "processing" else ["processing", "pending", "failed"]
+        if not claim_channel(cid, from_statuses=from_statuses):
+            print(f"  [SKIP] Could not claim {ch.get('platform')} ({cid}) — already claimed or done.")
+            continue
+        begin_attempt(cid)
+        claimed.append(ch)
+
+    if not claimed:
+        print("  Nothing claimed this cycle.")
+        _maybe_mark_clip_done(clip_id)
+        return
+
+    platforms = [c["platform"] for c in claimed]
+    platform_to_channel = {c["platform"]: c for c in claimed}
 
     results = post_to_all(
         video_path=video_path,
@@ -235,23 +336,102 @@ def process_clip(clip: dict, *, dry_run: bool, headless: bool, privacy: str) -> 
         ch = platform_to_channel.get(platform)
         if not ch:
             continue
-        if outcome.get("success"):
-            any_success = True
-            update_channel(
-                ch["id"],
-                status="success",
-                post_url=outcome.get("url"),
-            )
-        else:
-            update_channel(
-                ch["id"],
-                status="failed",
-                error_message=str(outcome.get("error") or "Upload failed"),
-            )
+        cid = str(ch["id"])
+        attempt = int(get_attempts(cid) or 1)
 
-    # Clip is "posted" once every pending channel has been attempted
-    mark_clip_posted(clip_id, True)
-    print(f"  Clip {clip_id} finished · any_success={any_success}")
+        kind = alert_for_outcome(
+            clip_id=clip_id,
+            platform=platform,
+            outcome=outcome or {},
+            attempt=attempt,
+            max_attempts=MAX_ATTEMPTS,
+        )
+
+        share_clicked = bool(
+            (outcome or {}).get("share_clicked")
+            or (outcome or {}).get("uncertain")
+            or kind == "uncertain"
+        )
+
+        if kind == "success":
+            any_success = True
+            update_channel(cid, status="success", post_url=(outcome or {}).get("url"))
+            finish_attempt(cid, kind="success")
+        elif kind == "uncertain":
+            update_channel(
+                cid,
+                status="uncertain",
+                error_message=str(
+                    (outcome or {}).get("error")
+                    or "Publish unconfirmed — check account; auto-retry disabled."
+                ),
+                post_url=(outcome or {}).get("url"),
+            )
+            finish_attempt(cid, kind="uncertain", share_clicked=True)
+        elif kind == "auth":
+            update_channel(
+                cid,
+                status="failed",
+                error_message=str((outcome or {}).get("error") or "Authentication failed"),
+            )
+            finish_attempt(cid, kind="auth")
+        elif kind == "permanent":
+            update_channel(
+                cid,
+                status="failed",
+                error_message=str((outcome or {}).get("error") or "Permanent upload failure"),
+            )
+            finish_attempt(cid, kind="permanent")
+        else:
+            # transient — leave failed; retry_state schedules next_retry_at
+            update_channel(
+                cid,
+                status="failed",
+                error_message=str((outcome or {}).get("error") or "Upload failed"),
+            )
+            entry = finish_attempt(cid, kind="transient", share_clicked=share_clicked)
+            if entry.get("next_retry_at"):
+                wait = max(0, int(entry["next_retry_at"] - _time.time()))
+                print(f"  [RETRY] {platform} will retry in ~{wait}s (attempt {attempt}/{MAX_ATTEMPTS})")
+
+    # Any claimed platform missing from results (thread crash) → failed, no success lie
+    for platform, ch in platform_to_channel.items():
+        if platform in results:
+            continue
+        cid = str(ch["id"])
+        err = "Uploader returned no outcome (worker thread error)."
+        update_channel(cid, status="failed", error_message=err)
+        finish_attempt(cid, kind="transient")
+        alert_for_outcome(
+            clip_id=clip_id,
+            platform=platform,
+            outcome={"success": False, "error": err},
+            attempt=get_attempts(cid),
+            max_attempts=MAX_ATTEMPTS,
+        )
+
+    _maybe_mark_clip_done(clip_id)
+    print(f"  Clip {clip_id} cycle done · any_success={any_success}")
+
+
+def _check_storage_usage(clips_root: Path) -> None:
+    """Warn via Discord when CLIPS_DIR disk usage exceeds 85%."""
+    from alerts import EVENT_STORAGE_HIGH, emit
+
+    try:
+        import shutil
+
+        usage = shutil.disk_usage(str(clips_root))
+        pct = (usage.used / usage.total) * 100 if usage.total else 0
+        threshold = float(os.environ.get("STORAGE_WARN_PERCENT", "85"))
+        if pct >= threshold:
+            emit(
+                EVENT_STORAGE_HIGH,
+                detail=f"Disk at {pct:.1f}% used ({usage.used // (1024**3)}G / {usage.total // (1024**3)}G) on {clips_root}",
+                dedupe_key=f"storage:{clips_root}",
+            )
+    except Exception as e:
+        print(f"  [WARN] Storage check failed: {e}")
 
 
 def run_loop(
@@ -264,7 +444,9 @@ def run_loop(
     batch: int = 5,
     stop_event: threading.Event | None = None,
 ):
+    from alerts import EVENT_SUPABASE_DOWN, emit
     from db import fetch_due_clips
+    from retry_state import bump_supabase_fail, record_heartbeat, reset_supabase_fail
 
     clips_root = get_clips_dir()
     print("\n" + "=" * 60)
@@ -281,8 +463,12 @@ def run_loop(
             print("[Worker] Stop signal received. Exiting run loop.")
             break
 
+        record_heartbeat()
+        _check_storage_usage(clips_root)
+
         try:
             due = fetch_due_clips(limit=batch)
+            reset_supabase_fail()
             if not due:
                 print(f"[{time.strftime('%H:%M:%S')}] Queue empty — waiting {poll_seconds}s…")
             else:
@@ -295,7 +481,15 @@ def run_loop(
                     except Exception as e:
                         print(f"  [FAIL] Unexpected error on clip {clip.get('id')}: {e}")
         except Exception as e:
+            streak = bump_supabase_fail()
             print(f"[{time.strftime('%H:%M:%S')}] Poll error: {e}")
+            # Critical after repeated Supabase/poll failures
+            if streak >= int(os.environ.get("SUPABASE_FAIL_ALERT_AFTER", "3")):
+                emit(
+                    EVENT_SUPABASE_DOWN,
+                    detail=f"Supabase/poll failed {streak} times in a row: {e}",
+                    dedupe_key="supabase:unavailable",
+                )
 
         if once:
             break

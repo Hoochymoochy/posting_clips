@@ -858,6 +858,7 @@ def upload_instagram_reel(
                 browser.close()
                 return {
                     "success": False,
+                    "error_kind": "auth",
                     "error": (
                         "Instagram session expired or not logged in.\n"
                         f"{_instagram_setup_help(session_dir)}"
@@ -966,9 +967,13 @@ def upload_instagram_reel(
                 browser.close()
                 return {
                     "success": False,
+                    "uncertain": True,
+                    "share_clicked": True,
+                    "error_kind": "uncertain",
                     "error": (
                         "Share was clicked but Instagram did not confirm the post finished. "
                         "Check the account manually — it may still have published. "
+                        "Auto-retry disabled to prevent double-posting. "
                         "Debug screenshot saved under scratch/."
                     ),
                     "url": url,
@@ -1149,9 +1154,10 @@ def _ig_wait_until_posted(page, username: str = "", timeout_s: int = 180) -> tup
                     print("  [OK] Detected: Your reel has been shared.")
                     _ig_click_done_after_share(page)
                     return True, post_url
-                if not _ig_share_still_in_progress(page):
-                    print("  [OK] Create dialog closed after share — treating post as finished.")
-                    return True, post_url
+                # Dialog closed without confirmation — do NOT treat as success
+                # (false positives were writing success to Supabase).
+                print("  [WARN] Create dialog closed without share confirmation — uncertain.")
+                return False, post_url
         except Exception:
             pass
 
@@ -1356,6 +1362,85 @@ def _find_tiktok_post_button(page):
     return None
 
 
+def _tt_page_indicates_posted(page) -> bool:
+    """Best-effort detection that TikTok accepted the publish."""
+    try:
+        url = (page.url or "").lower()
+        # Studio often navigates to content / manage after a successful post
+        if any(
+            part in url
+            for part in (
+                "/tiktokstudio/content",
+                "/tiktokstudio/manage",
+                "/creator-center/content",
+                "manage/video",
+            )
+        ):
+            return True
+    except Exception:
+        pass
+
+    try:
+        body = (page.locator("body").inner_text(timeout=2000) or "").lower()
+    except Exception:
+        body = ""
+
+    # Strong confirmations only
+    strong = (
+        "your video has been uploaded",
+        "video uploaded",
+        "uploaded successfully",
+        "post uploaded",
+        "successfully posted",
+    )
+    if any(t in body for t in strong):
+        return True
+
+    for sel in (
+        '[data-e2e="upload-success"]',
+        '[data-e2e="publish-success"]',
+        'div:has-text("Your video has been uploaded")',
+        'div:has-text("Uploaded")',
+    ):
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _tt_wait_until_posted(page, timeout_s: int = 90) -> tuple[bool, str | None]:
+    """
+    Wait for a real TikTok publish confirmation after Post is clicked.
+    Returns (confirmed, optional_url). Unconfirmed → caller must mark uncertain.
+    """
+    deadline = time.time() + timeout_s
+    post_url = None
+    while time.time() < deadline:
+        _dismiss_tiktok_modals(page)
+        if _tt_page_indicates_posted(page):
+            try:
+                post_url = page.url
+            except Exception:
+                post_url = "https://www.tiktok.com/tiktokstudio"
+            print("  [OK] TikTok publish confirmation detected.")
+            return True, post_url
+
+        # Still on upload editor with Post enabled → not done
+        try:
+            if "login" in (page.url or "").lower():
+                return False, None
+        except Exception:
+            pass
+
+        page.wait_for_timeout(2000)
+
+    print("  [WARN] TikTok Post clicked but no confirmation within timeout.")
+    return False, post_url
+
+
 def upload_tiktok_video(
     video_path: str,
     caption: str,
@@ -1409,6 +1494,7 @@ def upload_tiktok_video(
                 browser.close()
                 return {
                     "success": False,
+                    "error_kind": "auth",
                     "error": "TikTok session expired or not logged in. Please run: python uploader.py --setup-tiktok",
                 }
 
@@ -1418,7 +1504,11 @@ def upload_tiktok_video(
             for _ in range(15):
                 if "login" in page.url.lower():
                     browser.close()
-                    return {"success": False, "error": "TikTok session expired or not logged in. Run: python uploader.py --setup-tiktok"}
+                    return {
+                        "success": False,
+                        "error_kind": "auth",
+                        "error": "TikTok session expired or not logged in. Run: python uploader.py --setup-tiktok",
+                    }
 
                 _dismiss_tiktok_modals(page)
 
@@ -1493,12 +1583,25 @@ def upload_tiktok_video(
                     except Exception:
                         pass
 
-                page.wait_for_timeout(6000)
+                confirmed, post_url = _tt_wait_until_posted(page, timeout_s=90)
                 browser.close()
+                if confirmed:
+                    return {
+                        "success": True,
+                        "platform": "TikTok",
+                        "url": post_url or "https://www.tiktok.com/tiktokstudio",
+                    }
                 return {
-                    "success": True,
-                    "platform": "TikTok",
-                    "url": "https://www.tiktok.com/tiktokstudio",
+                    "success": False,
+                    "uncertain": True,
+                    "share_clicked": True,
+                    "error_kind": "uncertain",
+                    "error": (
+                        "TikTok Post was clicked but publish was not confirmed. "
+                        "Check TikTok Studio manually — the clip may already be live. "
+                        "Auto-retry disabled to prevent double-posting."
+                    ),
+                    "url": post_url or "https://www.tiktok.com/tiktokstudio",
                 }
             else:
                 browser.close()

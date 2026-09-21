@@ -198,8 +198,10 @@ async def _save_clip_files(
 @app.get("/", tags=["Health"])
 def health_check():
     """Health and status check endpoint."""
+    from alerts import EVENT_WORKER_DEAD, emit
     from connections import get_connections_status
     from db import check_connection
+    from retry_state import worker_heartbeat_age
 
     db_ok, db_err = check_connection()
     clips_dir = get_clips_dir()
@@ -208,6 +210,20 @@ def health_check():
     total_clips = 0
     if clips_dir.is_dir():
         total_clips = len([d for d in clips_dir.iterdir() if d.is_dir()])
+
+    hb_age = worker_heartbeat_age()
+    worker_running = is_worker_running()
+    # If worker is enabled but heartbeat is stale, fire a critical Discord alert
+    stale_after = int(os.environ.get("WORKER_HEARTBEAT_STALE_SECONDS", "120"))
+    if ENABLE_WORKER and (not worker_running or (hb_age is not None and hb_age > stale_after)):
+        emit(
+            EVENT_WORKER_DEAD,
+            detail=(
+                f"Background worker not healthy "
+                f"(running={worker_running}, heartbeat_age_s={hb_age})"
+            ),
+            dedupe_key="worker:dead",
+        )
 
     return {
         "status": "ok",
@@ -218,9 +234,10 @@ def health_check():
         },
         "background_worker": {
             "enabled": ENABLE_WORKER,
-            "running": is_worker_running(),
+            "running": worker_running,
             "poll_seconds": POLL_SECONDS,
             "dry_run": DRY_RUN,
+            "heartbeat_age_seconds": hb_age,
         },
         "storage": {
             "clips_dir": str(clips_dir),
