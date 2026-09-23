@@ -19,6 +19,7 @@ Features:
      - POST /api/connections/{platform}/connect
      - POST /api/connections/{platform}/disconnect
      - POST /api/worker/poll-now
+     - POST /api/update-queue
 """
 
 from __future__ import annotations
@@ -391,6 +392,28 @@ def trigger_poll_now():
             batch=BATCH_SIZE,
         )
         return {"success": True, "message": "Poll cycle completed successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/update-queue", tags=["Discovery"])
+@app.post("/update-queue", tags=["Discovery"])
+def update_discovery_queue():
+    """
+    Fetch DJ sets from Braindance and enqueue new youtube URLs into discovery_runs.
+    URLs already present in discovery_runs are skipped.
+    """
+    from db import get_supabase, is_configured
+    from discovery.queue import update_queue
+
+    if not is_configured():
+        raise HTTPException(status_code=503, detail="Supabase is not configured.")
+
+    try:
+        stats = update_queue(get_supabase())
+        return {"success": True, **stats}
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

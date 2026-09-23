@@ -1,4 +1,4 @@
-"""Discovery run tracking (daily limit + once-per-URL-per-day)."""
+"""Discovery run tracking (daily limit + once-per-URL-per-day) and queue updates."""
 
 from discovery.limiter import (
     MAX_RUNS_PER_DAY,
@@ -9,6 +9,13 @@ from discovery.limiter import (
     mark_run_failed,
     mark_run_success,
 )
+from discovery.queue import (
+    DEFAULT_DJ_SET_FEED_URL,
+    enqueue_urls,
+    extract_urls,
+    fetch_dj_sets,
+    update_queue,
+)
 
 __all__ = [
     "MAX_RUNS_PER_DAY",
@@ -18,4 +25,9 @@ __all__ = [
     "create_run",
     "mark_run_failed",
     "mark_run_success",
+    "DEFAULT_DJ_SET_FEED_URL",
+    "enqueue_urls",
+    "extract_urls",
+    "fetch_dj_sets",
+    "update_queue",
 ]
