@@ -1,4 +1,4 @@
-"""Discovery run tracking (daily limit + once-per-URL-per-day) and queue updates."""
+"""Discovery run tracking, queue updates, review, and GPU/Ollama pipeline."""
 
 from discovery.limiter import (
     MAX_RUNS_PER_DAY,
@@ -16,8 +16,10 @@ from discovery.queue import (
     enqueue_urls,
     extract_urls,
     fetch_dj_sets,
+    run_cron_cycle,
     update_queue,
 )
+from discovery.review import approve_candidate, decline_candidate, full_render_and_queue
 
 __all__ = [
     "MAX_RUNS_PER_DAY",
@@ -33,5 +35,9 @@ __all__ = [
     "enqueue_urls",
     "extract_urls",
     "fetch_dj_sets",
+    "run_cron_cycle",
     "update_queue",
+    "approve_candidate",
+    "decline_candidate",
+    "full_render_and_queue",
 ]

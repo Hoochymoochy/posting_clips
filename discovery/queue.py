@@ -125,8 +125,46 @@ def update_queue(supabase, feed_url: str | None = None) -> dict[str, Any]:
     return stats
 
 
+def run_cron_cycle(
+    supabase,
+    *,
+    feed_url: str | None = None,
+    process: bool = True,
+    max_runs: int = 1,
+) -> dict[str, Any]:
+    """
+    One cron tick: refresh discovery_runs from Braindance, then process pending work.
+
+    process=True runs the discovery pipeline (Ollama + GPU preview / approvals)
+    up to max_runs claimed discovery_runs (plus any approved full-renders each cycle).
+    """
+    queue_stats = update_queue(supabase, feed_url=feed_url)
+    result: dict[str, Any] = {
+        "success": True,
+        "queue": queue_stats,
+        "processed": [],
+    }
+    if not process:
+        return result
+
+    from discovery.pipeline import process_once
+
+    runs = max(0, int(max_runs))
+    for _ in range(runs):
+        outcome = process_once()
+        result["processed"].append(outcome)
+        # Stop early when nothing left to claim (still drains approvals once)
+        if outcome.get("skipped"):
+            break
+        if not outcome.get("ok") and not outcome.get("candidates"):
+            # Hard failure on a run — keep going only if more slots remain
+            continue
+    return result
+
+
 def main() -> None:
-    """CLI: fetch the DJ-set feed and upsert new URLs into discovery_runs."""
+    """CLI for cron: enqueue new URLs, then run the discovery worker once."""
+    import argparse
     import sys
     from pathlib import Path
 
@@ -139,6 +177,22 @@ def main() -> None:
 
     load_dotenv(root / ".env")
 
+    parser = argparse.ArgumentParser(
+        description="Cron entry: Braindance → discovery_runs → preview/render worker"
+    )
+    parser.add_argument(
+        "--enqueue-only",
+        action="store_true",
+        help="Only refresh discovery_runs (skip GPU/Ollama processing)",
+    )
+    parser.add_argument(
+        "--max-runs",
+        type=int,
+        default=int(os.environ.get("DISCOVERY_CRON_MAX_RUNS", "1") or "1"),
+        help="Max discovery_runs to process after enqueue (default: 1)",
+    )
+    args = parser.parse_args()
+
     from db import get_supabase, is_configured
 
     if not is_configured():
@@ -148,16 +202,34 @@ def main() -> None:
     feed = get_dj_set_feed_url()
     print(f"Fetching {feed} ...")
     try:
-        stats = update_queue(get_supabase())
+        result = run_cron_cycle(
+            get_supabase(),
+            process=not args.enqueue_only,
+            max_runs=args.max_runs,
+        )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
+    stats = result["queue"]
     print(
         f"fetched={stats['fetched']}  inserted={stats['inserted']}  skipped={stats['skipped']}"
     )
     for url in stats.get("inserted_urls") or []:
         print(f"  + {url}")
+
+    if args.enqueue_only:
+        return
+
+    for i, outcome in enumerate(result.get("processed") or [], start=1):
+        if outcome.get("skipped"):
+            print(f"process[{i}]: skipped (no pending runs / daily cap)")
+        elif outcome.get("ok"):
+            n = len(outcome.get("candidates") or [])
+            print(f"process[{i}]: ok candidates={n}")
+        else:
+            print(f"process[{i}]: failed — {outcome.get('error')}")
+            sys.exit(1)
 
 
 if __name__ == "__main__":

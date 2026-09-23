@@ -6,20 +6,17 @@ Features:
   1. Video ingestion API:
      - Stores received videos in: clips/[id]/clip.mp4
      - Caption / title / tags live in Supabase (not metadata.json)
-  2. Background polling service:
-     - Starts automatically in the background (unless disabled via ENABLE_BACKGROUND_WORKER=false)
-     - Queries Supabase for due clips
-     - Uploads to YouTube Shorts, Instagram Reels, and TikTok
-  3. Status & Health endpoints:
+  2. Background posting worker (ENABLE_BACKGROUND_WORKER):
+     - Polls Supabase for due clips and posts to social platforms
+  3. Discovery pipeline (ENABLE_DISCOVERY_WORKER):
+     - Claims discovery_runs, Ollama captions, GPU/CPU previews + full renders
+     - Review APIs for the Vercel web app
+  4. Status & Health endpoints:
      - GET /health
       - GET /api/clips
-      - GET /api/clips/{id}
-      - DELETE /api/clips/{id}
-     - GET /api/connections
-     - POST /api/connections/{platform}/connect
-     - POST /api/connections/{platform}/disconnect
-     - POST /api/worker/poll-now
-     - POST /api/update-queue
+      - GET /api/review/candidates
+      - POST /api/review/{id}/approve|decline
+      - POST /api/update-queue
 """
 
 from __future__ import annotations
@@ -29,12 +26,14 @@ import sys
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 from worker import (
     get_clips_dir,
@@ -63,6 +62,8 @@ DRY_RUN = os.environ.get("DRY_RUN", "false").lower() in ("1", "true", "yes")
 HEADLESS = os.environ.get("HEADED", "false").lower() not in ("1", "true", "yes")
 YOUTUBE_PRIVACY = os.environ.get("YOUTUBE_PRIVACY", "public")
 ENABLE_WORKER = os.environ.get("ENABLE_BACKGROUND_WORKER", "true").lower() in ("1", "true", "yes")
+ENABLE_DISCOVERY = os.environ.get("ENABLE_DISCOVERY_WORKER", "true").lower() in ("1", "true", "yes")
+DISCOVERY_POLL_SECONDS = int(os.environ.get("DISCOVERY_POLL_SECONDS", "120"))
 
 
 @asynccontextmanager
@@ -80,9 +81,26 @@ async def lifespan(app: FastAPI):
     else:
         print("[Server] Background worker disabled via ENABLE_BACKGROUND_WORKER=false.")
 
+    if ENABLE_DISCOVERY:
+        from discovery.pipeline import start_discovery_worker
+
+        print(
+            f"[Server] Starting discovery pipeline "
+            f"(GPU preview / Ollama / full render, poll every {DISCOVERY_POLL_SECONDS}s)..."
+        )
+        start_discovery_worker(poll_seconds=DISCOVERY_POLL_SECONDS)
+    else:
+        print("[Server] Discovery pipeline disabled via ENABLE_DISCOVERY_WORKER=false.")
+
     yield
 
-    # Shutdown: Stop background worker
+    # Shutdown
+    if ENABLE_DISCOVERY:
+        from discovery.pipeline import stop_discovery_worker
+
+        print("[Server] Stopping discovery pipeline...")
+        stop_discovery_worker(timeout=5.0)
+
     if ENABLE_WORKER:
         print("[Server] Stopping background posting worker...")
         stop_background_worker(timeout=3.0)
@@ -398,22 +416,202 @@ def trigger_poll_now():
 
 @app.post("/api/update-queue", tags=["Discovery"])
 @app.post("/update-queue", tags=["Discovery"])
-def update_discovery_queue():
+def update_discovery_queue(
+    process: bool = True,
+    max_runs: int = 1,
+):
     """
-    Fetch DJ sets from Braindance and enqueue new youtube URLs into discovery_runs.
-    URLs already present in discovery_runs are skipped.
+    Cron-friendly: fetch DJ sets into discovery_runs, then optionally run the
+    discovery worker (Ollama + GPU preview / approvals) on this host.
+
+    Query params:
+      process=true|false  (default true)
+      max_runs=1          how many discovery_runs to claim after enqueue
     """
     from db import get_supabase, is_configured
-    from discovery.queue import update_queue
+    from discovery.queue import run_cron_cycle
 
     if not is_configured():
         raise HTTPException(status_code=503, detail="Supabase is not configured.")
 
     try:
-        stats = update_queue(get_supabase())
-        return {"success": True, **stats}
+        result = run_cron_cycle(
+            get_supabase(),
+            process=process,
+            max_runs=max(0, int(max_runs)),
+        )
+        return result
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _api_public_base() -> str:
+    """Public base URL for absolute preview links (Vercel frontend)."""
+    return (
+        os.environ.get("PUBLIC_API_BASE_URL", "").strip().rstrip("/")
+        or os.environ.get("CLIP_API_BASE_URL", "").strip().rstrip("/")
+        or ""
+    )
+
+
+@app.get("/api/review/candidates", tags=["Review"])
+def review_list_candidates():
+    """List discovery candidates awaiting mobile review."""
+    from db import get_supabase, is_configured
+    from discovery.candidates import list_candidates, public_candidate
+
+    if not is_configured():
+        raise HTTPException(status_code=503, detail="Supabase is not configured.")
+
+    try:
+        rows = list_candidates(get_supabase(), status="awaiting_review", limit=50)
+        # Hide ones waiting on caption regen so the deck doesn't show stale captions mid-job
+        visible = [
+            r for r in rows
+            if (r.get("decline_reason") or "") != "caption_bad_pending"
+        ]
+        base = _api_public_base()
+        return {
+            "success": True,
+            "candidates": [public_candidate(r, api_base=base) for r in visible],
+            "count": len(visible),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/review/{candidate_id}/preview", tags=["Review"])
+def review_preview_video(candidate_id: str):
+    """Stream the cheap preview MP4 for a discovery candidate."""
+    from discovery.candidates import discovery_preview_path, get_candidate
+    from db import get_supabase, is_configured
+
+    path = discovery_preview_path(candidate_id)
+    if not path.is_file():
+        # Fall back to preview_path stored on the row (local generate machine path won't work
+        # on a remote poster — upload endpoint should have written here).
+        if is_configured():
+            row = get_candidate(get_supabase(), candidate_id)
+            alt = (row or {}).get("preview_path") or ""
+            if alt and Path(alt).is_file():
+                path = Path(alt)
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="Preview video not found")
+
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        filename=f"{candidate_id}_preview.mp4",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+@app.post("/api/review/{candidate_id}/preview", tags=["Review"])
+async def upload_review_preview(
+    candidate_id: str,
+    video: UploadFile = File(...),
+):
+    """GPU worker uploads a preview MP4 after cheap render."""
+    from db import get_supabase, is_configured
+    from discovery.candidates import discovery_preview_path, get_candidate, update_candidate
+
+    if not is_configured():
+        raise HTTPException(status_code=503, detail="Supabase is not configured.")
+
+    sb = get_supabase()
+    row = get_candidate(sb, candidate_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    dest = discovery_preview_path(candidate_id)
+    bytes_written = 0
+    with open(dest, "wb") as f:
+        while chunk := await video.read(CHUNK_SIZE):
+            f.write(chunk)
+            bytes_written += len(chunk)
+
+    base = _api_public_base()
+    preview_url = (
+        f"{base}/api/review/{candidate_id}/preview"
+        if base
+        else f"/api/review/{candidate_id}/preview"
+    )
+    updated = update_candidate(
+        sb,
+        candidate_id,
+        preview_path=str(dest),
+        preview_url=preview_url,
+        status="awaiting_review",
+    )
+    return {
+        "success": True,
+        "id": candidate_id,
+        "file_size_bytes": bytes_written,
+        "preview_url": preview_url,
+        "candidate": updated,
+    }
+
+
+@app.post("/api/review/{candidate_id}/approve", tags=["Review"])
+def review_approve(candidate_id: str):
+    """Approve a preview — discovery worker will full-render and schedule."""
+    from db import get_supabase, is_configured
+    from discovery.candidates import public_candidate
+    from discovery.review import approve_candidate
+
+    if not is_configured():
+        raise HTTPException(status_code=503, detail="Supabase is not configured.")
+
+    try:
+        updated = approve_candidate(get_supabase(), candidate_id)
+        return {
+            "success": True,
+            "candidate": public_candidate(updated, api_base=_api_public_base()),
+            "message": "Approved — full render queued on the discovery worker.",
+        }
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/review/{candidate_id}/decline", tags=["Review"])
+def review_decline(
+    candidate_id: str,
+    payload: dict[str, Any] | None = Body(default=None),
+):
+    """Decline a preview (clip_bad or caption_bad)."""
+    from db import get_supabase, is_configured
+    from discovery.candidates import public_candidate
+    from discovery.review import decline_candidate
+
+    if not is_configured():
+        raise HTTPException(status_code=503, detail="Supabase is not configured.")
+
+    body = payload or {}
+    reason = str(body.get("reason") or "").strip().lower()
+    try:
+        updated = decline_candidate(get_supabase(), candidate_id, reason)
+        regenerated = reason == "caption_bad"
+        return {
+            "success": True,
+            "candidate": public_candidate(updated, api_base=_api_public_base()),
+            "regenerated": regenerated,
+            "regenerating": False,
+            "message": (
+                "Caption rewritten via Ollama."
+                if regenerated
+                else "Clip rejected."
+            ),
+        }
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
