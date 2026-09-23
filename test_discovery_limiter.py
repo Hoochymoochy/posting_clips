@@ -31,6 +31,8 @@ class _FakeQuery:
         self._op: str | None = None
         self._payload: Any = None
         self._count_exact = False
+        self._order: tuple[str, bool] | None = None
+        self._limit: int | None = None
 
     def select(self, *_args, count: str | None = None, **_kwargs):
         self._op = "select"
@@ -59,6 +61,14 @@ class _FakeQuery:
         self._filters.append(("eq", col, val))
         return self
 
+    def order(self, col: str, desc: bool = False):
+        self._order = (col, desc)
+        return self
+
+    def limit(self, n: int):
+        self._limit = int(n)
+        return self
+
     def _matches(self, row: dict[str, Any]) -> bool:
         for kind, col, val in self._filters:
             cell = row.get(col)
@@ -76,6 +86,11 @@ class _FakeQuery:
     def execute(self) -> _Result:
         if self._op == "select":
             matched = [r for r in self._store if self._matches(r)]
+            if self._order:
+                col, desc = self._order
+                matched.sort(key=lambda r: str(r.get(col) or ""), reverse=desc)
+            if self._limit is not None:
+                matched = matched[: self._limit]
             return _Result(data=matched, count=len(matched) if self._count_exact else None)
         if self._op == "insert":
             row = {
@@ -203,3 +218,33 @@ def test_same_url_allowed_after_failure_same_day():
     run = create_run(sb, url)
     assert run["status"] == "pending"
     assert run["youtube_url"] == url
+
+
+def test_claim_next_pending_run_sets_processing():
+    from discovery.limiter import claim_next_pending_run
+
+    now = datetime.now(timezone.utc)
+    older = now - timedelta(minutes=5)
+    sb = FakeSupabase(
+        [
+            _row(status="pending", created_at=now, youtube_url="https://youtube.com/watch?v=new"),
+            _row(status="pending", created_at=older, youtube_url="https://youtube.com/watch?v=old"),
+        ]
+    )
+    claimed = claim_next_pending_run(sb)
+    assert claimed is not None
+    assert claimed["status"] == "processing"
+    assert claimed["youtube_url"].endswith("old")
+
+
+def test_claim_respects_daily_active_cap():
+    from discovery.limiter import MAX_RUNS_PER_DAY, claim_next_pending_run
+
+    now = datetime.now(timezone.utc)
+    rows = [
+        _row(status="success", created_at=now, youtube_url=f"https://youtube.com/watch?v=s{i}")
+        for i in range(MAX_RUNS_PER_DAY)
+    ]
+    rows.append(_row(status="pending", created_at=now, youtube_url="https://youtube.com/watch?v=wait"))
+    sb = FakeSupabase(rows)
+    assert claim_next_pending_run(sb) is None
