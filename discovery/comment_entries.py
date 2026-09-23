@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 from typing import Any
 
 from discovery.youtube_meta import (
@@ -490,11 +492,23 @@ def fetch_youtube_comments(
             "getcomments": True,
             "extractor_args": {
                 "youtube": {
+                    # web_safari avoids the missing-formats wall on datacenter IPs
+                    "player_client": ["web_safari"],
                     "max_comments": [str(per_sort)],
                     "comment_sort": [sort],
                 }
             },
         }
+        # YouTube blocks datacenter IPs ("Sign in to confirm you're not a bot").
+        # When a cookies.txt from a logged-in browser is available, use it.
+        cookies_file = os.environ.get("YT_COOKIES_FILE", "").strip()
+        if cookies_file and os.path.isfile(cookies_file):
+            ydl_opts["cookiefile"] = cookies_file
+        # Node solves YouTube's JS challenge so yt-dlp can mint PO tokens,
+        # which the web player now requires to serve formats.
+        if shutil.which("node"):
+            ydl_opts["js_runtimes"] = {"node": {}}
+            ydl_opts["remote_components"] = ["ejs:github"]
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(watch_url, download=False)

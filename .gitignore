@@ -17,3 +17,5 @@ clips/
 .retry_state.json
 .alert_dedupe.json
 scratch/
+
+youtube_cookies.txt
