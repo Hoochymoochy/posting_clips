@@ -38,6 +38,16 @@ if sys.platform == "win32":
 # Default hashtag recommendations for DJ sets & music shorts
 DEFAULT_HASHTAGS = ["#Shorts", "#DJ", "#ElectronicMusic", "#EDM", "#BoilerRoom", "#Festival", "#DJSet"]
 
+# Upload + Analytics (retention / avg view %). Re-auth required when expanding scopes.
+YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+YOUTUBE_READONLY_SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
+YOUTUBE_ANALYTICS_SCOPE = "https://www.googleapis.com/auth/yt-analytics.readonly"
+YOUTUBE_OAUTH_SCOPES = [
+    YOUTUBE_UPLOAD_SCOPE,
+    YOUTUBE_READONLY_SCOPE,
+    YOUTUBE_ANALYTICS_SCOPE,
+]
+
 
 def resolve_config_path(config_path: str = "clients.json") -> str:
     """Resolve preferred config path (clients.json > config.json)."""
@@ -379,20 +389,31 @@ def upload_youtube_short(
             "error": "Missing Google API libraries. Run: pip install google-api-python-client google-auth-oauthlib",
         }
 
-    scopes = ["https://www.googleapis.com/auth/youtube.upload"]
+    # Prefer full scopes; fall back to upload-only so existing tokens still upload.
+    scopes = list(YOUTUBE_OAUTH_SCOPES)
     creds = None
 
     if token_data and isinstance(token_data, dict):
         try:
             creds = Credentials.from_authorized_user_info(token_data, scopes)
         except Exception:
-            creds = None
+            try:
+                creds = Credentials.from_authorized_user_info(
+                    token_data, [YOUTUBE_UPLOAD_SCOPE]
+                )
+            except Exception:
+                creds = None
 
     if not creds and os.path.exists(token_file):
         try:
             creds = Credentials.from_authorized_user_file(token_file, scopes)
         except Exception:
-            creds = None
+            try:
+                creds = Credentials.from_authorized_user_file(
+                    token_file, [YOUTUBE_UPLOAD_SCOPE]
+                )
+            except Exception:
+                creds = None
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:

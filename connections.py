@@ -21,6 +21,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 from uploader import (
+    YOUTUBE_ANALYTICS_SCOPE,
+    YOUTUBE_OAUTH_SCOPES,
+    YOUTUBE_UPLOAD_SCOPE,
     _persist_youtube_creds,
     load_config,
     save_clients_config,
@@ -198,7 +201,14 @@ def setup_youtube_interactive(config_path: str = "clients.json") -> dict[str, An
     cfg = load_config(config_path)
     yt = cfg.get("youtube", {})
     secrets, token_file = _youtube_paths(cfg)
-    scopes = ["https://www.googleapis.com/auth/youtube.upload"]
+    scopes = list(YOUTUBE_OAUTH_SCOPES)
+
+    def _has_analytics(creds_obj) -> bool:
+        granted = set(creds_obj.scopes or [])
+        if not granted:
+            # Token JSON without scopes — force re-auth so Analytics is included.
+            return False
+        return YOUTUBE_ANALYTICS_SCOPE in granted
 
     has_client_secrets_dict = isinstance(yt.get("client_secrets"), dict)
     if not has_client_secrets_dict and not os.path.isfile(secrets):
@@ -206,7 +216,8 @@ def setup_youtube_interactive(config_path: str = "clients.json") -> dict[str, An
             "success": False,
             "error": (
                 f"YouTube client secrets not found in clients.json or ({secrets}).\n"
-                "1. Google Cloud Console → enable YouTube Data API v3\n"
+                "1. Google Cloud Console → enable YouTube Data API v3 "
+                "and YouTube Analytics API\n"
                 "2. Create OAuth Desktop client\n"
                 "3. Download JSON and save into clients.json "
                 "(or as client_secrets.json in posting_clips/)"
@@ -218,18 +229,28 @@ def setup_youtube_interactive(config_path: str = "clients.json") -> dict[str, An
         try:
             creds = Credentials.from_authorized_user_info(yt["token"], scopes)
         except Exception:
-            creds = None
+            try:
+                creds = Credentials.from_authorized_user_info(
+                    yt["token"], [YOUTUBE_UPLOAD_SCOPE]
+                )
+            except Exception:
+                creds = None
 
     if not creds and os.path.exists(token_file):
         try:
             creds = Credentials.from_authorized_user_file(token_file, scopes)
         except Exception:
-            creds = None
+            try:
+                creds = Credentials.from_authorized_user_file(
+                    token_file, [YOUTUBE_UPLOAD_SCOPE]
+                )
+            except Exception:
+                creds = None
 
-    if creds and creds.valid:
+    if creds and creds.valid and _has_analytics(creds):
         return {"success": True, "message": "YouTube already connected.", "token_file": token_file}
 
-    if creds and creds.expired and creds.refresh_token:
+    if creds and creds.expired and creds.refresh_token and _has_analytics(creds):
         try:
             creds.refresh(Request())
             _persist_youtube_creds(creds, token_file=token_file, config_path=config_path)
@@ -240,17 +261,22 @@ def setup_youtube_interactive(config_path: str = "clients.json") -> dict[str, An
     print("\n========================================================")
     print("YouTube OAuth Setup")
     print("========================================================")
-    print("A browser window will open. Sign in and allow youtube.upload.\n")
+    print(
+        "A browser window will open. Sign in and allow YouTube upload "
+        "+ Analytics (retention) access.\n"
+        "Ensure YouTube Analytics API is enabled in Google Cloud Console.\n"
+    )
 
     if has_client_secrets_dict:
         flow = InstalledAppFlow.from_client_config(yt["client_secrets"], scopes)
     else:
         flow = InstalledAppFlow.from_client_secrets_file(secrets, scopes)
-    creds = flow.run_local_server(port=0)
+    # Force consent so newly added Analytics scopes are granted on existing apps.
+    creds = flow.run_local_server(port=0, prompt="consent")
 
     _persist_youtube_creds(creds, token_file=token_file, config_path=config_path)
 
-    print("[OK] YouTube token saved to clients.json")
+    print("[OK] YouTube token saved to clients.json (upload + analytics scopes)")
     return {"success": True, "message": "YouTube connected. Token saved.", "token_file": token_file}
 
 

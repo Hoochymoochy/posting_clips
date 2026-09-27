@@ -141,6 +141,31 @@ python uploader.py --setup-tiktok
 - **Endpoint**: `POST /api/worker/poll-now`
 - Forces an immediate polling check against Supabase.
 
+### 7. Analytics (published posts)
+Lives in this same process — uses the host’s `clients.json` / sessions. SQL migration: [`analytics/migrations/001_create_analytics_tables.sql`](analytics/migrations/001_create_analytics_tables.sql).
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/analytics/posts` | Live-pull metrics for YouTube + Instagram (`?platform=` optional). TikTok skipped for now. Alias: `/api/posts` |
+| `GET /api/analytics/posts/{clip_id}` | Same for one clip. Alias: `/api/posts/{clip_id}` |
+| `GET /api/analytics/health` | DB + credential path checks |
+
+YouTube retention uses **`average_watch_percent`** (avg % of the Short watched) via the **YouTube Analytics API**. One-time setup:
+
+1. Enable **YouTube Analytics API** here:  
+   https://console.developers.google.com/apis/api/youtubeanalytics.googleapis.com/overview?project=303012426859
+2. Re-connect YouTube so the token includes Analytics scopes:  
+   `python uploader.py --setup-youtube`
+3. Analytics data can lag 24–48h after a Short is published. Until the API is enabled, views/likes still work but `average_watch_percent` stays null.
+
+Standalone worker (optional; or set `ENABLE_ANALYTICS_WORKER=true` on the API server):
+
+```bash
+python -m analytics.worker
+python -m analytics.worker --once
+python -m analytics.worker --poll-seconds 1800
+```
+
 ---
 
 ## Environment Variables (.env)
@@ -164,6 +189,10 @@ python uploader.py --setup-tiktok
 | `UPLOAD_MAX_ATTEMPTS` | `3` | Max transient upload retries per platform channel |
 | `UPLOAD_RETRY_BACKOFF` | `60,300,900` | Seconds between retry attempts |
 | `STORAGE_WARN_PERCENT` | `85` | Disk usage % that triggers a Discord warning |
+| `ENABLE_ANALYTICS_WORKER` | `false` | Run hourly analytics sync inside this server |
+| `ANALYTICS_POLL_SECONDS` | `3600` | Seconds between analytics sync cycles |
+| `AUTO_EXPORT_JSON` | `true` | Write JSON snapshots under `analytics/exports/` |
+| `YOUTUBE_API_KEY` | - | Optional YouTube Data API key (else yt-dlp) |
 
 ### Alerts & safe retries
 

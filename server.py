@@ -11,7 +11,10 @@ Features:
   3. Discovery pipeline (ENABLE_DISCOVERY_WORKER):
      - Claims discovery_runs, Ollama captions, GPU/CPU previews + full renders
      - Review APIs for the Vercel web app
-  4. Status & Health endpoints:
+  4. Analytics (ENABLE_ANALYTICS_WORKER):
+     - Live YouTube / Instagram / TikTok metrics for published posts
+     - GET /api/analytics/posts  (also /api/posts)
+  5. Status & Health endpoints:
      - GET /health
       - GET /api/clips
       - GET /api/review/candidates
@@ -64,6 +67,13 @@ YOUTUBE_PRIVACY = os.environ.get("YOUTUBE_PRIVACY", "public")
 ENABLE_WORKER = os.environ.get("ENABLE_BACKGROUND_WORKER", "true").lower() in ("1", "true", "yes")
 ENABLE_DISCOVERY = os.environ.get("ENABLE_DISCOVERY_WORKER", "true").lower() in ("1", "true", "yes")
 DISCOVERY_POLL_SECONDS = int(os.environ.get("DISCOVERY_POLL_SECONDS", "120"))
+ENABLE_ANALYTICS = os.environ.get("ENABLE_ANALYTICS_WORKER", "false").lower() in ("1", "true", "yes")
+ANALYTICS_POLL_SECONDS = int(
+    os.environ.get(
+        "ANALYTICS_POLL_SECONDS",
+        os.environ.get("POLL_INTERVAL_SECONDS", "3600"),
+    )
+)
 
 
 @asynccontextmanager
@@ -92,9 +102,26 @@ async def lifespan(app: FastAPI):
     else:
         print("[Server] Discovery pipeline disabled via ENABLE_DISCOVERY_WORKER=false.")
 
+    if ENABLE_ANALYTICS:
+        from analytics.worker import start_background_worker as start_analytics_worker
+
+        print(
+            f"[Server] Starting analytics worker "
+            f"(poll every {ANALYTICS_POLL_SECONDS}s)..."
+        )
+        start_analytics_worker(poll_seconds=ANALYTICS_POLL_SECONDS)
+    else:
+        print("[Server] Analytics worker disabled via ENABLE_ANALYTICS_WORKER=false.")
+
     yield
 
     # Shutdown
+    if ENABLE_ANALYTICS:
+        from analytics.worker import stop_background_worker as stop_analytics_worker
+
+        print("[Server] Stopping analytics worker...")
+        stop_analytics_worker()
+
     if ENABLE_DISCOVERY:
         from discovery.pipeline import stop_discovery_worker
 
@@ -120,6 +147,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+from analytics.routes import router as analytics_router  # noqa: E402
+
+app.include_router(analytics_router)
 
 
 CHUNK_SIZE = 1024 * 1024  # 1MB chunk size for video streaming
@@ -244,6 +275,17 @@ def health_check():
             dedupe_key="worker:dead",
         )
 
+    analytics_running = False
+    analytics_creds: dict[str, Any] = {}
+    try:
+        from analytics.config import credential_status
+        from analytics.worker import is_worker_running as analytics_worker_running
+
+        analytics_running = analytics_worker_running()
+        analytics_creds = credential_status()
+    except Exception:
+        pass
+
     return {
         "status": "ok",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -257,6 +299,12 @@ def health_check():
             "poll_seconds": POLL_SECONDS,
             "dry_run": DRY_RUN,
             "heartbeat_age_seconds": hb_age,
+        },
+        "analytics_worker": {
+            "enabled": ENABLE_ANALYTICS,
+            "running": analytics_running,
+            "poll_seconds": ANALYTICS_POLL_SECONDS,
+            "credentials": analytics_creds,
         },
         "storage": {
             "clips_dir": str(clips_dir),
