@@ -29,6 +29,18 @@ Rules:
 - Output ONLY the caption — no labels, quotes, or reasoning"""
 
 
+def _system_prompt_for_archetype(hook_archetype: str | None = None) -> str:
+    from hook_archetypes import prompt_fragment_for
+
+    fragment = prompt_fragment_for(hook_archetype)
+    if not fragment:
+        return _SYSTEM_PROMPT
+    return (
+        f"{_SYSTEM_PROMPT}\n\n"
+        f"HOOK ARCHETYPE (follow this style closely):\n{fragment}"
+    )
+
+
 def _normalize_ollama_host(raw: str | None) -> str:
     """Accept full URLs or host/port fragments from OLLAMA_HOST."""
     text = (raw or "").strip() or "http://127.0.0.1:11434"
@@ -84,6 +96,7 @@ def _build_user_prompt(
     video_title: str = "",
     entry_timestamp: str = "",
     extra_comments: list[str] | None = None,
+    hook_archetype: str | None = None,
 ) -> str:
     parts = []
     title = (video_title or "").strip()
@@ -101,10 +114,14 @@ def _build_user_prompt(
         parts.append("NEARBY FAN COMMENTS (same moment):")
         for i, extra in enumerate(extras, start=1):
             parts.append(f"  {i}. {extra}")
+    style_note = ""
+    if hook_archetype:
+        style_note = f" Use the {hook_archetype} hook archetype style."
     parts.append(
         "Write one fun, hype caption for this clip. "
         "Lean on the set title for personality (artist/venue vibe)."
         + (" Blend the nearby comments into one vibe — don't list them." if extras else "")
+        + style_note
     )
     return "\n".join(parts)
 
@@ -115,6 +132,7 @@ def rewrite_caption_with_ollama(
     video_title: str = "",
     entry_timestamp: str = "",
     extra_comments: list[str] | None = None,
+    hook_archetype: str | None = None,
     model: str | None = None,
     host: str | None = None,
     timeout_sec: float = 60.0,
@@ -124,6 +142,7 @@ def rewrite_caption_with_ollama(
 
     Falls back to a light template (or raw comment) if Ollama is down.
     ``extra_comments`` are sibling reactions from a time cluster (optional).
+    ``hook_archetype`` steers the caption into a defined hook style.
     """
     raw = (comment_text or "").strip()
     title = (video_title or "").strip()
@@ -131,6 +150,7 @@ def rewrite_caption_with_ollama(
         return {"success": False, "error": "No comment or title to rewrite.", "caption": ""}
 
     fallback = _personality_fallback(raw, title)
+    archetype = (hook_archetype or "").strip().lower() or None
 
     model_name = (model or DEFAULT_OLLAMA_MODEL).strip() or DEFAULT_OLLAMA_MODEL
     base = _normalize_ollama_host(host or DEFAULT_OLLAMA_HOST)
@@ -139,7 +159,7 @@ def rewrite_caption_with_ollama(
     body: dict[str, Any] = {
         "model": model_name,
         "messages": [
-            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "system", "content": _system_prompt_for_archetype(archetype)},
             {
                 "role": "user",
                 "content": _build_user_prompt(
@@ -147,6 +167,7 @@ def rewrite_caption_with_ollama(
                     video_title=title,
                     entry_timestamp=entry_timestamp,
                     extra_comments=extra_comments,
+                    hook_archetype=archetype,
                 ),
             },
         ],
@@ -186,6 +207,7 @@ def rewrite_caption_with_ollama(
             "caption": fallback,
             "fallback": True,
             "model": model_name,
+            "hook_archetype": archetype,
         }
     except urllib.error.URLError as exc:
         return {
@@ -196,6 +218,7 @@ def rewrite_caption_with_ollama(
             ),
             "caption": fallback,
             "fallback": True,
+            "hook_archetype": archetype,
         }
     except TimeoutError:
         return {
@@ -203,6 +226,7 @@ def rewrite_caption_with_ollama(
             "error": f"Ollama timed out after {timeout_sec}s.",
             "caption": fallback,
             "fallback": True,
+            "hook_archetype": archetype,
         }
     except Exception as exc:
         return {
@@ -210,6 +234,7 @@ def rewrite_caption_with_ollama(
             "error": f"Ollama request failed: {exc}",
             "caption": fallback,
             "fallback": True,
+            "hook_archetype": archetype,
         }
 
     message = payload.get("message") or {}
@@ -221,6 +246,7 @@ def rewrite_caption_with_ollama(
             "caption": fallback,
             "fallback": True,
             "model": model_name,
+            "hook_archetype": archetype,
         }
 
     return {
@@ -229,6 +255,7 @@ def rewrite_caption_with_ollama(
         "model": model_name,
         "source_comment": raw,
         "video_title": title,
+        "hook_archetype": archetype,
     }
 
 

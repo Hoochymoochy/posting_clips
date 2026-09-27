@@ -24,17 +24,26 @@ def _extra_comments_from_candidate(candidate: dict[str, Any]) -> tuple[str, list
     return primary, texts
 
 
-def regenerate_caption(candidate: dict[str, Any]) -> str:
+def regenerate_caption(candidate: dict[str, Any]) -> tuple[str, str]:
+    """
+    Rewrite caption for a candidate. Reuses existing hook_archetype when set;
+    otherwise selects a new one. Returns (caption, hook_archetype).
+    """
+    from hook_archetypes import select_archetype
     from ollama_caption import rewrite_caption_with_ollama
 
     primary, extras = _extra_comments_from_candidate(candidate)
+    existing = (candidate.get("hook_archetype") or "").strip().lower()
+    archetype = existing or select_archetype()
     result = rewrite_caption_with_ollama(
         primary,
         video_title=str(candidate.get("title") or ""),
         entry_timestamp=str(candidate.get("start_time") or ""),
         extra_comments=extras,
+        hook_archetype=archetype,
     )
-    return (result.get("caption") or primary or candidate.get("title") or "New DJ clip").strip()
+    caption = (result.get("caption") or primary or candidate.get("title") or "New DJ clip").strip()
+    return caption, archetype
 
 
 def approve_candidate(supabase, candidate_id: str) -> dict[str, Any]:
@@ -83,12 +92,13 @@ def decline_candidate(supabase, candidate_id: str, reason: str) -> dict[str, Any
             decline_reason="clip_bad",
         )
 
-    new_caption = regenerate_caption(candidate)
+    new_caption, hook_archetype = regenerate_caption(candidate)
     return update_candidate(
         supabase,
         candidate_id,
         status="awaiting_review",
         caption=new_caption,
+        hook_archetype=hook_archetype,
         decline_reason="caption_bad",
     )
 
@@ -122,6 +132,7 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
     end = candidate.get("end_time") or start
     title = (candidate.get("title") or "DJ Clip").strip()
     caption = (candidate.get("caption") or title).strip()
+    hook_archetype = (candidate.get("hook_archetype") or "").strip().lower() or None
 
     stem = f"{_safe_stem(title)}_{_safe_stem(str(start))}_{str(uuid.uuid4())[:8]}"
     out_path = workspace_dir() / "renders" / f"{stem}_fullscreen.mp4"
@@ -144,6 +155,27 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
         dest_video = dest_folder / "clip.mp4"
         shutil.copy2(out_path, dest_video)
 
+        # Prefer start/end delta; fall back to probing the rendered file.
+        duration_seconds = None
+        try:
+            from discovery.youtube_meta import parse_timestamp_seconds
+
+            s = parse_timestamp_seconds(start)
+            e = parse_timestamp_seconds(end)
+            if s is not None and e is not None and e > s:
+                duration_seconds = round(float(e) - float(s), 2)
+        except Exception:
+            pass
+        if duration_seconds is None:
+            try:
+                from uploader import get_video_info
+
+                info = get_video_info(str(dest_video))
+                if info.get("duration"):
+                    duration_seconds = round(float(info["duration"]), 2)
+            except Exception:
+                pass
+
         storage_url = f"clips/{clip_id}/clip.mp4"
         db_result = register_clip(
             clip_id=clip_id,
@@ -154,6 +186,8 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
             start_time=start,
             end_time=end,
             scheduled_at=scheduled_at,
+            hook_archetype=hook_archetype,
+            duration_seconds=duration_seconds,
         )
         updated = update_candidate(
             supabase,

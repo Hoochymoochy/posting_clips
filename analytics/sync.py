@@ -105,6 +105,7 @@ def pull_channel_analytics(channel: dict[str, Any]) -> dict[str, Any]:
             comments=metrics.comments,
             shares=metrics.shares,
             saves=metrics.saves,
+            average_watch_percent=metrics.average_view_percentage,
         )
 
     return _channel_response(channel, metrics, captured_at)

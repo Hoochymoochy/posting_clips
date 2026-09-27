@@ -57,9 +57,12 @@ def _safe_stem(text: str, *, fallback: str = "clip") -> str:
     return cleaned or fallback
 
 
-def _caption_for_entry(entry: dict[str, Any], video_title: str) -> str:
+def _caption_for_entry(entry: dict[str, Any], video_title: str) -> tuple[str, str]:
+    """Return (caption, hook_archetype). Selects archetype then generates within it."""
+    from hook_archetypes import select_archetype
     from ollama_caption import rewrite_caption_with_ollama
 
+    archetype = select_archetype()
     primary = (entry.get("text") or "").strip()
     extras = [
         str(c.get("text") or "").strip()
@@ -73,8 +76,10 @@ def _caption_for_entry(entry: dict[str, Any], video_title: str) -> str:
         video_title=video_title,
         entry_timestamp=str(entry.get("entry_timestamp") or ""),
         extra_comments=extras[1:] if len(extras) > 1 else extras,
+        hook_archetype=archetype,
     )
-    return (result.get("caption") or primary or video_title or "New DJ clip").strip()
+    caption = (result.get("caption") or primary or video_title or "New DJ clip").strip()
+    return caption, archetype
 
 
 def process_run(run: dict[str, Any]) -> dict[str, Any]:
@@ -131,7 +136,7 @@ def process_run(run: dict[str, Any]) -> dict[str, Any]:
     for entry in entries:
         start = entry.get("entry_timestamp") or "00:00:00"
         end = entry.get("end_timestamp") or start
-        caption = _caption_for_entry(entry, video_title)
+        caption, hook_archetype = _caption_for_entry(entry, video_title)
         stem = f"{_safe_stem(video_title)}_{_safe_stem(start, fallback='t')}"
         segment_path = segments_dir / f"{stem}_{uuid.uuid4().hex[:8]}_segment.mp4"
 
@@ -143,6 +148,7 @@ def process_run(run: dict[str, Any]) -> dict[str, Any]:
             end_time=end,
             title=video_title or None,
             caption=caption,
+            hook_archetype=hook_archetype,
             source_comments=entry.get("comments") or [
                 {"text": entry.get("text"), "like_count": entry.get("like_count")}
             ],

@@ -41,6 +41,7 @@ def insert_candidate(
     end_time: str | None = None,
     title: str | None = None,
     caption: str | None = None,
+    hook_archetype: str | None = None,
     source_comments: list[dict[str, Any]] | None = None,
     preview_path: str | None = None,
     preview_url: str | None = None,
@@ -58,6 +59,7 @@ def insert_candidate(
         "end_time": normalize_clip_timestamp(end_time),
         "title": (title or "").strip() or None,
         "caption": (caption or "").strip() or None,
+        "hook_archetype": (hook_archetype or "").strip().lower() or None,
         "source_comments": source_comments or [],
         "preview_path": preview_path,
         "preview_url": preview_url,
@@ -118,6 +120,7 @@ def update_candidate(supabase, candidate_id: str, **fields: Any) -> dict[str, An
         "source_comments",
         "start_time",
         "end_time",
+        "hook_archetype",
     }
     for key, value in fields.items():
         if key not in allowed:

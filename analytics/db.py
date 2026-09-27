@@ -160,19 +160,41 @@ def update_channel_metrics(
     comments: int,
     shares: int,
     saves: int,
+    average_watch_percent: float | None = None,
 ) -> None:
     client = get_supabase()
     now = datetime.now(timezone.utc).isoformat()
-    client.table("channels").update(
-        {
-            "views": int(views or 0),
-            "likes": int(likes or 0),
-            "comments": int(comments or 0),
-            "shares": int(shares or 0),
-            "saves": int(saves or 0),
-            "last_analytics_at": now,
-        }
-    ).eq("id", channel_id).execute()
+    payload: dict[str, Any] = {
+        "views": int(views or 0),
+        "likes": int(likes or 0),
+        "comments": int(comments or 0),
+        "shares": int(shares or 0),
+        "saves": int(saves or 0),
+        "last_analytics_at": now,
+    }
+    awp_value = None
+    if average_watch_percent is not None:
+        try:
+            awp_value = float(average_watch_percent)
+            payload["average_watch_percent"] = awp_value
+        except (TypeError, ValueError):
+            awp_value = None
+    try:
+        client.table("channels").update(payload).eq("id", channel_id).execute()
+    except Exception as exc:
+        # Column may not exist until migration 007 is applied.
+        err = str(exc).lower()
+        if awp_value is not None and (
+            "average_watch_percent" in err or "column" in err or "schema" in err
+        ):
+            payload.pop("average_watch_percent", None)
+            client.table("channels").update(payload).eq("id", channel_id).execute()
+            print(
+                f"  [WARN] channels.average_watch_percent missing; "
+                f"ran migration 007? Wrote views/likes only ({exc})"
+            )
+        else:
+            raise
 
 
 def rollup_clip_totals(clip_id: str) -> None:

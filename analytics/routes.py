@@ -61,6 +61,23 @@ def get_all_posts(
     return {"count": len(posts), "posts": posts}
 
 
+@router.get("/api/analytics/hook-archetypes")
+def get_hook_archetype_stats():
+    """
+    Per-archetype performance (YouTube average_watch_percent only).
+    Includes count, mean AWP, mean views/likes, undersampled flag, and confound
+    distributions from channels.posted_at / clips.duration_seconds.
+    """
+    if not db.is_configured():
+        raise HTTPException(status_code=503, detail="Supabase is not configured")
+    try:
+        from hook_archetypes import build_hook_report
+
+        return build_hook_report()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+
 @router.get("/api/analytics/posts/{clip_id}")
 @router.get("/api/posts/{clip_id}")
 def get_post(
@@ -94,3 +111,4 @@ def get_post(
         }
 
     return posts[0]
+

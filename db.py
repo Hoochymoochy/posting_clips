@@ -173,6 +173,8 @@ def register_clip(
     end_time: str | None = None,
     scheduled_at: Any = None,
     platforms: list[str] | None = None,
+    hook_archetype: str | None = None,
+    duration_seconds: float | None = None,
 ) -> dict[str, Any]:
     """
     Insert or upsert a clip record and its pending channel rows in Supabase.
@@ -193,6 +195,18 @@ def register_clip(
     }
     if clip_id:
         row["id"] = clip_id
+
+    archetype = (hook_archetype or "").strip().lower() or None
+    if archetype:
+        row["hook_archetype"] = archetype
+
+    if duration_seconds is None and start_time and end_time:
+        duration_seconds = _duration_seconds_from_timestamps(start_time, end_time)
+    if duration_seconds is not None:
+        try:
+            row["duration_seconds"] = float(duration_seconds)
+        except (TypeError, ValueError):
+            pass
 
     if scheduled_at:
         if isinstance(scheduled_at, datetime):
@@ -230,6 +244,22 @@ def register_clip(
         "clip": clip,
         "channels": list(channels_res.data or []),
     }
+
+
+def _duration_seconds_from_timestamps(start_time: Any, end_time: Any) -> float | None:
+    """Compute clip length from start/end timestamp strings."""
+    try:
+        from discovery.youtube_meta import parse_timestamp_seconds
+    except ImportError:
+        return None
+    start = parse_timestamp_seconds(start_time)
+    end = parse_timestamp_seconds(end_time)
+    if start is None or end is None:
+        return None
+    dur = float(end) - float(start)
+    if dur <= 0:
+        return None
+    return round(dur, 2)
 
 
 # Terminal statuses — clip can be marked posted once every channel is one of these

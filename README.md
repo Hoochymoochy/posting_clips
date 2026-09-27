@@ -148,6 +148,7 @@ Lives in this same process — uses the host’s `clients.json` / sessions. SQL 
 |---|---|
 | `GET /api/analytics/posts` | Live-pull metrics for YouTube + Instagram (`?platform=` optional). TikTok skipped for now. Alias: `/api/posts` |
 | `GET /api/analytics/posts/{clip_id}` | Same for one clip. Alias: `/api/posts/{clip_id}` |
+| `GET /api/analytics/hook-archetypes` | Per-hook-archetype stats (YouTube `average_watch_percent`, views/likes, cold-start flags) |
 | `GET /api/analytics/health` | DB + credential path checks |
 
 YouTube retention uses **`average_watch_percent`** (avg % of the Short watched) via the **YouTube Analytics API**. One-time setup:
@@ -193,6 +194,9 @@ python -m analytics.worker --poll-seconds 1800
 | `ANALYTICS_POLL_SECONDS` | `3600` | Seconds between analytics sync cycles |
 | `AUTO_EXPORT_JSON` | `true` | Write JSON snapshots under `analytics/exports/` |
 | `YOUTUBE_API_KEY` | - | Optional YouTube Data API key (else yt-dlp) |
+| `HOOK_STRATEGY` | `epsilon_greedy` | Hook archetype selection strategy |
+| `HOOK_EPSILON` | `0.2` | Exploration rate (0–1) for archetype selection |
+| `HOOK_MIN_SAMPLES` | `5` | Min YouTube AWP samples before an archetype can be exploited |
 
 ### Alerts & safe retries
 
