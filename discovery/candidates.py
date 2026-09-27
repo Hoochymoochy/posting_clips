@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import random
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -21,9 +23,49 @@ DISCOVERY_CANDIDATE_STATUSES = (
     "needs_caption",
 )
 
-DEFAULT_POST_BUFFER_HOURS = float(
-    __import__("os").environ.get("POST_BUFFER_HOURS", "2") or "2"
+# Random gap from the last post/schedule (minute precision) to avoid exact cadence.
+MIN_POST_BUFFER_HOURS = float(os.environ.get("POST_BUFFER_MIN_HOURS", "3") or "3")
+MAX_POST_BUFFER_HOURS = float(os.environ.get("POST_BUFFER_MAX_HOURS", "6") or "6")
+
+# Optional fixed override. Prefer MIN/MAX for anti-automation jitter.
+_fixed_buffer = os.environ.get("POST_BUFFER_HOURS")
+DEFAULT_POST_BUFFER_HOURS = (
+    float(_fixed_buffer) if _fixed_buffer not in (None, "") else None
 )
+
+
+def _random_post_buffer(
+    *,
+    buffer_hours: float | None = None,
+    min_hours: float | None = None,
+    max_hours: float | None = None,
+) -> tuple[timedelta, timedelta]:
+    """
+    Pick the delay until the next post.
+
+    Returns (delay, lookback) where lookback is the max gap used when scanning
+    recent posts. Delay is randomized at minute granularity unless a fixed
+    buffer_hours / POST_BUFFER_HOURS override is set.
+    """
+    if buffer_hours is not None:
+        hours = max(0.0, float(buffer_hours))
+        fixed = timedelta(hours=hours)
+        return fixed, fixed
+
+    if DEFAULT_POST_BUFFER_HOURS is not None:
+        hours = max(0.0, float(DEFAULT_POST_BUFFER_HOURS))
+        fixed = timedelta(hours=hours)
+        return fixed, fixed
+
+    lo = MIN_POST_BUFFER_HOURS if min_hours is None else float(min_hours)
+    hi = MAX_POST_BUFFER_HOURS if max_hours is None else float(max_hours)
+    lo = max(0.0, lo)
+    hi = max(lo, hi)
+    lo_minutes = int(round(lo * 60))
+    hi_minutes = int(round(hi * 60))
+    delay = timedelta(minutes=random.randint(lo_minutes, hi_minutes))
+    lookback = timedelta(hours=hi)
+    return delay, lookback
 
 
 def discovery_preview_path(candidate_id: str) -> Path:
@@ -182,11 +224,19 @@ def next_scheduled_at(
     supabase,
     *,
     buffer_hours: float | None = None,
+    min_hours: float | None = None,
+    max_hours: float | None = None,
     now: datetime | None = None,
 ) -> str:
-    hours = DEFAULT_POST_BUFFER_HOURS if buffer_hours is None else float(buffer_hours)
-    hours = max(0.0, hours)
-    buffer = timedelta(hours=hours)
+    """
+    Schedule the next clip a random 3–6 hours (incl. minutes) after the latest
+    scheduled/posted clip, so posts do not land on a fixed cadence.
+    """
+    buffer, lookback = _random_post_buffer(
+        buffer_hours=buffer_hours,
+        min_hours=min_hours,
+        max_hours=max_hours,
+    )
     anchor = now or datetime.now(timezone.utc)
     if anchor.tzinfo is None:
         anchor = anchor.replace(tzinfo=timezone.utc)
@@ -210,11 +260,16 @@ def next_scheduled_at(
                 posted_at = _parse_iso_dt(row.get("updated_at"))
                 if (
                     posted_at
-                    and (anchor - posted_at) <= buffer * 2
-                    and posted_at > latest - buffer
+                    and (anchor - posted_at) <= lookback * 2
+                    and posted_at > latest - lookback
                 ):
                     latest = max(latest, posted_at)
     except Exception as exc:
         print(f"  [WARN] next_scheduled_at lookup failed: {exc}")
 
-    return (max(latest, anchor) + buffer).isoformat()
+    when = max(latest, anchor) + buffer
+    print(
+        f"  [schedule] next post at {when.isoformat()} "
+        f"(+{buffer} from last activity)"
+    )
+    return when.isoformat()
