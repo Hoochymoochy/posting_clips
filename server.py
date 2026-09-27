@@ -20,6 +20,7 @@ Features:
       - GET /api/review/candidates
       - POST /api/review/{id}/approve|decline
       - POST /api/update-queue
+      - POST /api/studio/comments|caption  (Manual Clip Studio)
 """
 
 from __future__ import annotations
@@ -662,6 +663,113 @@ def review_decline(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/studio/comments", tags=["Studio"])
+def studio_scan_comments(payload: dict[str, Any] | None = Body(default=None)):
+    """
+    Manual Clip Studio: scrape timestamped YouTube comments for a URL and return
+    clip-moment candidates (clustered by default, same logic as discovery).
+    """
+    body = payload or {}
+    url = str(body.get("url") or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="url is required")
+
+    mode = str(body.get("mode") or "cluster").strip().lower()
+    top_n = max(1, min(int(body.get("top_n") or 8), 15))
+    duration_sec = max(5, min(int(body.get("duration_sec") or 30), 60))
+    max_comments = max(20, min(int(body.get("max_comments") or 400), 500))
+
+    try:
+        if mode == "rank":
+            from discovery.comment_entries import find_comment_entry_points
+
+            result = find_comment_entry_points(
+                url,
+                top_n=top_n,
+                duration_sec=duration_sec,
+                max_comments=max_comments,
+            )
+        else:
+            from discovery.comment_entries import find_clustered_comment_entries
+
+            result = find_clustered_comment_entries(
+                url,
+                top_n=top_n,
+                duration_sec=duration_sec,
+                max_comments=max_comments,
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=502,
+            detail=result.get("error") or "Comment scrape failed",
+        )
+
+    return {
+        "success": True,
+        "url": url,
+        "mode": mode if mode in ("cluster", "rank") else "cluster",
+        "entries": result.get("entries") or [],
+        "scanned": result.get("scanned"),
+        "video_title": result.get("video_title"),
+        "video_duration": result.get("video_duration"),
+        "duration_sec": result.get("duration_sec") or duration_sec,
+        "message": result.get("message"),
+    }
+
+
+@app.post("/api/studio/caption", tags=["Studio"])
+def studio_generate_caption(payload: dict[str, Any] | None = Body(default=None)):
+    """
+    Manual Clip Studio: rewrite a fan comment (plus optional nearby comments)
+    into a social caption via Ollama on this host.
+    """
+    body = payload or {}
+    comment_text = str(body.get("comment_text") or body.get("comment") or "").strip()
+    video_title = str(body.get("video_title") or body.get("title") or "").strip()
+    entry_timestamp = str(body.get("entry_timestamp") or body.get("start") or "").strip()
+    extras_raw = body.get("extra_comments") or body.get("comments") or []
+    if not isinstance(extras_raw, list):
+        extras_raw = []
+    extra_comments = [str(c).strip() for c in extras_raw if str(c).strip()]
+
+    if not comment_text and not video_title:
+        raise HTTPException(
+            status_code=400,
+            detail="comment_text or video_title is required",
+        )
+
+    try:
+        from hook_archetypes import select_archetype
+        from ollama_caption import rewrite_caption_with_ollama, short_hook_overlay
+
+        archetype = str(body.get("hook_archetype") or "").strip() or select_archetype()
+        result = rewrite_caption_with_ollama(
+            comment_text or video_title,
+            video_title=video_title,
+            entry_timestamp=entry_timestamp,
+            extra_comments=extra_comments,
+            hook_archetype=archetype,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    caption = (result.get("caption") or comment_text or video_title or "").strip()
+    hook_overlay = short_hook_overlay(caption)
+    return {
+        "success": bool(result.get("success")) or bool(caption),
+        "caption": caption,
+        "hook_overlay": hook_overlay,
+        "fallback": bool(result.get("fallback")),
+        "error": result.get("error"),
+        "model": result.get("model"),
+        "hook_archetype": result.get("hook_archetype") or result.get("archetype"),
+        "source_comment": comment_text,
+    }
 
 
 @app.get("/api/connections", tags=["Connections"])

@@ -484,49 +484,77 @@ def fetch_youtube_comments(
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
     per_sort = max(40, max_comments // 2)
 
-    def _extract(sort: str) -> tuple[list[dict[str, Any]], float | None, str | None, str | None]:
-        ydl_opts: dict[str, Any] = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "getcomments": True,
-            "extractor_args": {
-                "youtube": {
-                    # web_safari avoids the missing-formats wall on datacenter IPs
-                    "player_client": ["web_safari"],
-                    "max_comments": [str(per_sort)],
-                    "comment_sort": [sort],
-                }
-            },
-        }
-        # YouTube blocks datacenter IPs ("Sign in to confirm you're not a bot").
-        # When a cookies.txt from a logged-in browser is available, use it.
-        cookies_file = os.environ.get("YT_COOKIES_FILE", "").strip()
-        if cookies_file and os.path.isfile(cookies_file):
-            ydl_opts["cookiefile"] = cookies_file
-        # Node solves YouTube's JS challenge so yt-dlp can mint PO tokens,
-        # which the web player now requires to serve formats.
-        if shutil.which("node"):
-            ydl_opts["js_runtimes"] = {"node": {}}
-            ydl_opts["remote_components"] = ["ejs:github"]
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(watch_url, download=False)
-        except Exception as exc:
-            return [], None, None, f"Failed to fetch comments: {exc}"
+    # Comment scrapes don't need playable formats. YouTube/client combos often
+    # raise "Requested format is not available" even with skip_download — ignore
+    # that and retry a few player clients.
+    client_attempts: list[list[str]] = [
+        ["android", "web"],
+        ["ios", "web"],
+        ["mweb", "web"],
+        ["web_safari"],
+        ["tv_embedded", "web"],
+        ["web"],
+    ]
 
-        if not info:
-            return [], None, None, "No video info returned."
-        comments = info.get("comments") or []
-        if not isinstance(comments, list):
-            comments = []
-        duration = info.get("duration")
-        try:
-            video_duration = float(duration) if duration is not None else None
-        except (TypeError, ValueError):
-            video_duration = None
-        video_title = str(info.get("title") or "").strip() or None
-        return comments, video_duration, video_title, None
+    def _clean_err(exc: BaseException) -> str:
+        # Strip ANSI color codes yt-dlp sometimes embeds in exception text.
+        raw = str(exc)
+        return re.sub(r"\x1b\[[0-9;]*m", "", raw).strip()
+
+    def _extract(sort: str) -> tuple[list[dict[str, Any]], float | None, str | None, str | None]:
+        last_err: str | None = None
+        for clients in client_attempts:
+            ydl_opts: dict[str, Any] = {
+                "quiet": True,
+                "no_warnings": True,
+                "skip_download": True,
+                "getcomments": True,
+                # Critical: comment-only extract must survive missing formats.
+                "ignore_no_formats_error": True,
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": clients,
+                        "max_comments": [str(per_sort)],
+                        "comment_sort": [sort],
+                    }
+                },
+            }
+            cookies_file = os.environ.get("YT_COOKIES_FILE", "").strip()
+            if cookies_file and os.path.isfile(cookies_file):
+                ydl_opts["cookiefile"] = cookies_file
+            if shutil.which("node"):
+                ydl_opts["js_runtimes"] = {"node": {}}
+                ydl_opts["remote_components"] = ["ejs:github"]
+
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(watch_url, download=False)
+            except Exception as exc:
+                last_err = _clean_err(exc)
+                # Format-only failures → try next client; other errors too.
+                continue
+
+            if not info:
+                last_err = "No video info returned."
+                continue
+
+            comments = info.get("comments") or []
+            if not isinstance(comments, list):
+                comments = []
+            # Formats failed but metadata/comments may still be present.
+            if not comments and not info.get("title") and not info.get("duration"):
+                last_err = "Empty extract (no comments/metadata)."
+                continue
+
+            duration = info.get("duration")
+            try:
+                video_duration = float(duration) if duration is not None else None
+            except (TypeError, ValueError):
+                video_duration = None
+            video_title = str(info.get("title") or "").strip() or None
+            return comments, video_duration, video_title, None
+
+        return [], None, None, f"Failed to fetch comments: {last_err or 'unknown error'}"
 
     top_comments, video_duration, video_title, err_top = _extract("top")
     new_comments, video_duration_new, video_title_new, err_new = _extract("new")

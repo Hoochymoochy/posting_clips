@@ -277,3 +277,40 @@ def _personality_fallback(comment: str, title: str) -> str:
     if short_title:
         return f"Ladies and gentlemen... {short_title}. This one's a moment."
     return cleaned or "This drop hits different."
+
+
+def short_hook_overlay(caption: str, *, max_len: int = 42) -> str:
+    """
+    Derive a short on-video hook from a social caption.
+
+    Burned-in title overlays need a punchy 3–8 word line — not the full
+    YouTube venue title ("DOM DOLLA B2B SOLOMUN LIVE @ THE WOOL STORE…").
+    """
+    text = re.sub(r"[#@]\S+", "", caption or "")
+    text = re.sub(r"\s+", " ", text).strip(" -–—|,.")
+    if not text:
+        return "THIS DROP HITS DIFFERENT"
+
+    # Prefer first real sentence/clause with substance
+    parts = re.split(r"[.!?…]+|\s+[—-]\s+", text)
+    candidates = [p.strip(" -–—|,.") for p in parts if p and p.strip(" -–—|,.")]
+    chosen = ""
+    for part in candidates:
+        cleaned = re.sub(
+            r"^(ladies and gentlemen[,.]?\s*|check this[,.]?\s*|watch this[,.]?\s*)",
+            "",
+            part,
+            flags=re.I,
+        ).strip()
+        if len(cleaned) >= 8:
+            chosen = cleaned
+            break
+        if not chosen and len(part) >= 8:
+            chosen = part
+    text = chosen or text
+
+    if len(text) > max_len:
+        clipped = text[:max_len].rsplit(" ", 1)[0].strip()
+        text = clipped or text[:max_len]
+
+    return (text or "THIS DROP HITS DIFFERENT").upper()
