@@ -20,6 +20,9 @@ def generate_clips_dir() -> Path:
     sibling = _POSTING_ROOT.parent / "generate_clips"
     if (sibling / "main.py").is_file():
         return sibling.resolve()
+    bundled = _POSTING_ROOT / "render"
+    if (bundled / "main.py").is_file():
+        return bundled.resolve()
     raise RuntimeError(
         "generate_clips/main.py not found. Set GENERATE_CLIPS_DIR to the folder "
         "that contains main.py (GPU/FFmpeg render pipeline)."

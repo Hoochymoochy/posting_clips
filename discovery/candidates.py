@@ -204,7 +204,8 @@ def public_candidate(row: dict[str, Any], *, api_base: str = "") -> dict[str, An
     cid = out.get("id")
     base = (api_base or "").rstrip("/")
     if cid:
-        out["preview_url"] = f"{base}/api/review/{cid}/preview" if base else f"/api/review/{cid}/preview"
+        path = f"/api/review/{cid}/preview?v=notitle"
+        out["preview_url"] = f"{base}{path}" if base else path
     return out
 
 

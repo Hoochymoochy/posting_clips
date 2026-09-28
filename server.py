@@ -613,8 +613,30 @@ def review_preview_video(candidate_id: str):
         path,
         media_type="video/mp4",
         filename=f"{candidate_id}_preview.mp4",
-        headers={"Cache-Control": "public, max-age=3600"},
+        headers={"Cache-Control": "private, no-cache"},
     )
+
+
+@app.post("/api/review/rebuild-previews", tags=["Review"])
+def review_rebuild_previews(limit: int = 50, status: str = "awaiting_review"):
+    """
+    Re-render preview MP4s for the review deck without burned-in YouTube set titles.
+    Run once after deploying preview render changes, or when old previews still show venue text.
+    """
+    from db import get_supabase, is_configured
+    from discovery.preview_rebuild import rebuild_awaiting_review_previews
+
+    if not is_configured():
+        raise HTTPException(status_code=503, detail="Supabase is not configured.")
+
+    try:
+        return rebuild_awaiting_review_previews(
+            get_supabase(),
+            limit=limit,
+            status=(status or "awaiting_review").strip(),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/review/{candidate_id}/preview", tags=["Review"])
@@ -643,9 +665,9 @@ async def upload_review_preview(
 
     base = _api_public_base()
     preview_url = (
-        f"{base}/api/review/{candidate_id}/preview"
+        f"{base}/api/review/{candidate_id}/preview?v=notitle"
         if base
-        else f"/api/review/{candidate_id}/preview"
+        else f"/api/review/{candidate_id}/preview?v=notitle"
     )
     updated = update_candidate(
         sb,

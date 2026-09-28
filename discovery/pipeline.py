@@ -168,9 +168,9 @@ def process_run(run: dict[str, Any]) -> dict[str, Any]:
                 segment_path=segment_path,
             )
             preview_url = (
-                f"{api_base}/api/review/{candidate_id}/preview"
+                f"{api_base}/api/review/{candidate_id}/preview?v=notitle"
                 if api_base
-                else f"/api/review/{candidate_id}/preview"
+                else f"/api/review/{candidate_id}/preview?v=notitle"
             )
             updated = update_candidate(
                 sb,
