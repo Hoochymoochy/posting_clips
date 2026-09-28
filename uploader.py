@@ -424,24 +424,7 @@ def upload_youtube_short(
                 creds = None
 
         if not creds:
-            if not os.path.exists(client_secrets_file):
-                if os.path.exists(f"{client_secrets_file}.json"):
-                    client_secrets_file = f"{client_secrets_file}.json"
-                elif os.path.exists("client_secrets.json.json"):
-                    client_secrets_file = "client_secrets.json.json"
-                else:
-                    return {
-                        "success": False,
-                        "error": (
-                            f"YouTube client secrets file not found: {client_secrets_file}.\n"
-                            "To set up YouTube upload:\n"
-                            "  1. Go to Google Cloud Console (https://console.cloud.google.com/)\n"
-                            "  2. Create a project and enable 'YouTube Data API v3'\n"
-                            "  3. Create OAuth 2.0 Client ID credentials (Desktop app)\n"
-                            "  4. Download JSON and save as 'client_secrets.json' in this folder."
-                        ),
-                    }
-            flow = InstalledAppFlow.from_client_secrets_file(client_secrets_file, scopes)
+            # Prefer embedded clients.json secrets; only require a file as fallback.
             if client_secrets_data and isinstance(client_secrets_data, dict):
                 flow = InstalledAppFlow.from_client_config(client_secrets_data, scopes)
             else:
@@ -454,20 +437,35 @@ def upload_youtube_short(
                         return {
                             "success": False,
                             "error": (
-                                f"YouTube client secrets file not found: {client_secrets_file}.\n"
+                                f"YouTube client secrets not found "
+                                f"(no clients.json youtube.client_secrets and no file "
+                                f"{client_secrets_file}).\n"
                                 "To set up YouTube upload:\n"
                                 "  1. Go to Google Cloud Console (https://console.cloud.google.com/)\n"
                                 "  2. Create a project and enable 'YouTube Data API v3'\n"
                                 "  3. Create OAuth 2.0 Client ID credentials (Desktop app)\n"
-                                "  4. Download JSON and save into clients.json (or as 'client_secrets.json' in this folder)."
+                                "  4. Save credentials into clients.json as youtube.client_secrets "
+                                "(or as client_secrets.json in this folder),\n"
+                                "     then run: python uploader.py --setup-youtube"
                             ),
                         }
                 flow = InstalledAppFlow.from_client_secrets_file(client_secrets_file, scopes)
-            creds = flow.run_local_server(port=0)
+            # Interactive OAuth needs a display/browser — fail clearly on headless servers.
+            try:
+                creds = flow.run_local_server(port=0)
+            except Exception as exc:
+                return {
+                    "success": False,
+                    "error": (
+                        "YouTube OAuth token missing/expired and interactive login is required. "
+                        f"Copy a valid clients.json youtube.token to this host, or run "
+                        f"python uploader.py --setup-youtube on a machine with a browser. ({exc})"
+                    ),
+                }
             _persist_youtube_creds(creds, token_file=token_file)
 
-        with open(token_file, "w", encoding="utf-8") as token:
-            token.write(creds.to_json())
+            with open(token_file, "w", encoding="utf-8") as token:
+                token.write(creds.to_json())
 
     youtube = build("youtube", "v3", credentials=creds)
 
