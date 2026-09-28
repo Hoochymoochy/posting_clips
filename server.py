@@ -17,6 +17,7 @@ Features:
   5. Status & Health endpoints:
      - GET /health
       - GET /api/clips
+      - POST /api/clips/{id}/retry/{platform}  (retry one failed platform)
       - GET /api/review/candidates
       - POST /api/review/{id}/approve|decline
       - POST /api/update-queue
@@ -382,25 +383,82 @@ async def upload_clip(
 @app.get("/api/clips/{id}", tags=["Clips"])
 @app.get("/clips/{id}", tags=["Clips"])
 def get_clip_info(id: str):
-    """Check storage status for a specific clip ID."""
+    """Check storage status for a specific clip ID (local files + Supabase channels)."""
     clips_dir = get_clips_dir()
     folder = clips_dir / id.strip()
 
-    if not folder.is_dir():
-        raise HTTPException(status_code=404, detail=f"Clip {id} not found in {clips_dir}.")
-
-    video_file = folder / "clip.mp4"
-    has_video = video_file.is_file()
+    video_file = folder / "clip.mp4" if folder.is_dir() else None
+    has_video = bool(video_file and video_file.is_file())
     video_size = video_file.stat().st_size if has_video else 0
 
+    supabase_clip = None
+    try:
+        from db import get_clip_by_id, is_configured
+
+        if is_configured():
+            supabase_clip = get_clip_by_id(id.strip())
+    except Exception as e:
+        print(f"  [WARN] get_clip_by_id failed: {e}")
+
+    if not has_video and not supabase_clip:
+        raise HTTPException(status_code=404, detail=f"Clip {id} not found in {clips_dir} or Supabase.")
+
+    channels = (supabase_clip or {}).get("channels") or []
     return {
         "id": id,
-        "folder": str(folder),
+        "folder": str(folder) if folder.is_dir() else None,
         "video_exists": has_video,
         "video_path": str(video_file) if has_video else None,
         "video_size_bytes": video_size,
-        "storage_url": f"clips/{id}/clip.mp4" if has_video else None,
+        "storage_url": f"clips/{id}/clip.mp4" if has_video else (supabase_clip or {}).get("storage_url"),
+        "title": (supabase_clip or {}).get("title"),
+        "caption": (supabase_clip or {}).get("caption"),
+        "posted": (supabase_clip or {}).get("posted"),
+        "scheduled_at": (supabase_clip or {}).get("scheduled_at"),
+        "channels": channels,
+        "failed_platforms": [
+            (c.get("platform") or "").lower()
+            for c in channels
+            if (c.get("status") or "").lower() in ("failed", "uncertain")
+        ],
     }
+
+
+@app.post("/api/clips/{id}/retry/{platform}", tags=["Clips"])
+@app.post("/clips/{id}/retry/{platform}", tags=["Clips"])
+def retry_clip_platform_route(
+    id: str,
+    platform: str,
+    force: bool = False,
+    immediate: bool = True,
+):
+    """
+    Retry a single platform for a clip (e.g. YouTube failed → retry only YouTube).
+
+    Query params:
+      force=false     — required to retry success/uncertain/processing
+      immediate=true  — run upload now; if false, just reset to pending for the worker
+
+    Example: POST /api/clips/{id}/retry/youtube
+    """
+    from worker import retry_clip_platform
+
+    try:
+        return retry_clip_platform(
+            id.strip(),
+            platform,
+            force=force,
+            immediate=immediate,
+            dry_run=DRY_RUN,
+            headless=HEADLESS,
+            privacy=YOUTUBE_PRIVACY,
+        )
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/api/clips", tags=["Clips"])

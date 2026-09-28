@@ -187,6 +187,114 @@ def _maybe_mark_clip_done(clip_id: str) -> None:
         print(f"  Clip {clip_id} still has open channels — leaving posted=false for retry.")
 
 
+def retry_clip_platform(
+    clip_id: str,
+    platform: str,
+    *,
+    force: bool = False,
+    immediate: bool = True,
+    dry_run: bool = False,
+    headless: bool = True,
+    privacy: str = "public",
+) -> dict[str, Any]:
+    """
+    Manually retry one platform for a clip (frontend / ops).
+
+    Resets that channel to pending, clears local retry budget, sets posted=false,
+    then optionally runs the upload for only that platform right away.
+    Refuses status=success unless force=True (double-post risk).
+    Refuses status=uncertain unless force=True.
+    """
+    from db import (
+        get_clip_by_id,
+        mark_clip_posted,
+        update_channel,
+    )
+    from retry_state import clear_channel
+
+    plat = (platform or "").strip().lower()
+    if plat not in ("youtube", "instagram", "tiktok"):
+        raise ValueError("platform must be youtube, instagram, or tiktok")
+
+    clip = get_clip_by_id(clip_id)
+    if not clip:
+        raise LookupError(f"Clip not found: {clip_id}")
+
+    channels = clip.get("channels") or []
+    channel = next(
+        (c for c in channels if (c.get("platform") or "").lower() == plat),
+        None,
+    )
+    if not channel:
+        raise LookupError(f"No {plat} channel row for clip {clip_id}")
+
+    status = (channel.get("status") or "").lower()
+    if status == "success" and not force:
+        raise ValueError(
+            f"{plat} already succeeded (post_url={channel.get('post_url')!r}). "
+            "Pass force=true only if you intentionally want to post again."
+        )
+    if status == "uncertain" and not force:
+        raise ValueError(
+            f"{plat} is uncertain (Share/Post may already have been clicked). "
+            "Verify the account first, then pass force=true to retry."
+        )
+    if status == "processing" and not force:
+        raise ValueError(
+            f"{plat} is currently processing. Wait, or pass force=true to reset."
+        )
+
+    cid = str(channel["id"])
+    clear_channel(cid)
+    update_channel(cid, status="pending", error_message=None)
+    mark_clip_posted(clip_id, False)
+
+    result: dict[str, Any] = {
+        "success": True,
+        "clip_id": clip_id,
+        "platform": plat,
+        "channel_id": cid,
+        "previous_status": status,
+        "reset_to": "pending",
+        "posted_cleared": True,
+        "immediate": immediate,
+    }
+
+    if not immediate:
+        result["message"] = (
+            f"{plat} reset to pending; worker will pick it up on the next poll."
+        )
+        return result
+
+    fresh = get_clip_by_id(clip_id)
+    if not fresh:
+        raise RuntimeError("Clip disappeared after reset")
+
+    # Narrow to the one platform so process_clip only uploads that channel
+    target = None
+    for ch in fresh.get("channels") or []:
+        if (ch.get("platform") or "").lower() == plat:
+            target = ch
+            break
+    if not target:
+        raise RuntimeError(f"Channel {plat} missing after reset")
+
+    # Feed process_clip a clip dict with only this channel actionable
+    fresh["channels"] = [target]
+    print(f"\n[manual-retry] {clip_id} → {plat} (force={force})")
+    process_clip(fresh, dry_run=dry_run, headless=headless, privacy=privacy)
+
+    after = get_clip_by_id(clip_id)
+    ch_after = None
+    for ch in (after or {}).get("channels") or []:
+        if (ch.get("platform") or "").lower() == plat:
+            ch_after = ch
+            break
+    result["channel"] = ch_after
+    result["message"] = f"Immediate retry for {plat} finished."
+    return result
+
+
 def process_clip(clip: dict, *, dry_run: bool, headless: bool, privacy: str) -> None:
     import time as _time
 

@@ -77,7 +77,7 @@ def fetch_due_clips(limit: int = 10) -> list[dict[str, Any]]:
         .select(
             "id, youtube_url, youtube_video_id, title, caption, tags, "
             "start_time, end_time, storage_url, posted, scheduled_at, created_at, "
-            "channels(id, platform, status, post_url, error_message)"
+            "channels(id, platform, status, post_url, error_message, posted_at)"
         )
         .eq("posted", False)
         .order("created_at", desc=False)
@@ -127,7 +127,7 @@ def get_clip_by_id(clip_id: str) -> dict[str, Any] | None:
         .select(
             "id, youtube_url, youtube_video_id, title, caption, tags, "
             "start_time, end_time, storage_url, posted, scheduled_at, created_at, "
-            "channels(id, platform, status, post_url, error_message)"
+            "channels(id, platform, status, post_url, error_message, posted_at)"
         )
         .eq("id", clip_id)
         .limit(1)
