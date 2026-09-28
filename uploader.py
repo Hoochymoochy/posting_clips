@@ -209,24 +209,11 @@ def load_config(config_path: str = "clients.json") -> dict:
         },
     }
 
-    # 1) Full clients blob (cloud-friendly): CLIENTS_JSON or CLIENTS_JSON_BASE64
-    env_clients = _parse_env_json("CLIENTS_JSON")
-    if isinstance(env_clients, dict):
-        for section, values in env_clients.items():
-            if section in config and isinstance(values, dict):
-                config[section].update(values)
-            elif section not in config:
-                config[section] = values
-        if not os.path.isfile("clients.json"):
-            try:
-                with open("clients.json", "w", encoding="utf-8") as f:
-                    json.dump(env_clients, f, indent=2)
-                print("[config] Wrote clients.json from CLIENTS_JSON env.")
-            except Exception:
-                pass
+    # Prefer on-disk clients.json when present (so scp/paste after local OAuth works).
+    # Env CLIENTS_JSON* is only a bootstrap when the file is missing.
+    loaded_from_disk = False
 
-    # 2) Otherwise load from disk
-    elif actual_path and os.path.isfile(actual_path):
+    if actual_path and os.path.isfile(actual_path):
         try:
             with open(actual_path, "r", encoding="utf-8") as f:
                 user_cfg = json.load(f)
@@ -235,18 +222,36 @@ def load_config(config_path: str = "clients.json") -> dict:
                         config[section].update(values)
                     elif section not in config:
                         config[section] = values
+            loaded_from_disk = True
         except Exception as e:
             print(f"Warning: Failed to parse {actual_path}: {e}")
 
-    # 3) Discrete YouTube env keys (no need to ship clients.json)
-    #    YOUTUBE_CLIENT_SECRETS_JSON / YOUTUBE_CLIENT_SECRETS_JSON_BASE64
-    #    YOUTUBE_TOKEN_JSON / YOUTUBE_TOKEN_JSON_BASE64
+    # Cloud bootstrap: CLIENTS_JSON / CLIENTS_JSON_BASE64 only if no file on disk
+    if not loaded_from_disk:
+        env_clients = _parse_env_json("CLIENTS_JSON")
+        if isinstance(env_clients, dict):
+            for section, values in env_clients.items():
+                if section in config and isinstance(values, dict):
+                    config[section].update(values)
+                elif section not in config:
+                    config[section] = values
+            if not os.path.isfile("clients.json"):
+                try:
+                    with open("clients.json", "w", encoding="utf-8") as f:
+                        json.dump(env_clients, f, indent=2)
+                    print("[config] Wrote clients.json from CLIENTS_JSON env.")
+                except Exception:
+                    pass
+
+    # Discrete env keys only fill gaps (do not clobber a pasted clients.json token).
     yt_secrets_obj = _parse_env_json("YOUTUBE_CLIENT_SECRETS_JSON")
-    if isinstance(yt_secrets_obj, dict):
+    if isinstance(yt_secrets_obj, dict) and not isinstance(
+        config["youtube"].get("client_secrets"), dict
+    ):
         config["youtube"]["client_secrets"] = yt_secrets_obj
 
     yt_token_obj = _parse_env_json("YOUTUBE_TOKEN_JSON")
-    if isinstance(yt_token_obj, dict):
+    if isinstance(yt_token_obj, dict) and not isinstance(config["youtube"].get("token"), dict):
         config["youtube"]["token"] = yt_token_obj
 
     # Instagram session cookie from env
@@ -420,7 +425,8 @@ def upload_youtube_short(
             try:
                 creds.refresh(Request())
                 _persist_youtube_creds(creds, token_file=token_file)
-            except Exception:
+            except Exception as refresh_exc:
+                print(f"  [WARN] YouTube token refresh failed: {refresh_exc}")
                 creds = None
 
         if not creds:
@@ -454,12 +460,16 @@ def upload_youtube_short(
             try:
                 creds = flow.run_local_server(port=0)
             except Exception as exc:
+                has_token = bool(token_data and isinstance(token_data, dict) and token_data.get("refresh_token"))
                 return {
                     "success": False,
                     "error": (
                         "YouTube OAuth token missing/expired and interactive login is required. "
-                        f"Copy a valid clients.json youtube.token to this host, or run "
-                        f"python uploader.py --setup-youtube on a machine with a browser. ({exc})"
+                        f"(token_present={has_token}; refresh may have failed — check logs for "
+                        f"'YouTube token refresh failed'). "
+                        "Ensure clients.json on this host has youtube.token.refresh_token, "
+                        "WorkingDirectory is posting_clips, and CLIENTS_JSON* env is not an old blob. "
+                        f"Or run python uploader.py --setup-youtube on a machine with a browser. ({exc})"
                     ),
                 }
             _persist_youtube_creds(creds, token_file=token_file)
