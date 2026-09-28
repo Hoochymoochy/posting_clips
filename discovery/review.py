@@ -130,11 +130,16 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
     youtube_url = (candidate.get("youtube_url") or "").strip()
     start = candidate.get("start_time") or "00:00:00"
     end = candidate.get("end_time") or start
-    title = (candidate.get("title") or "DJ Clip").strip()
-    caption = (candidate.get("caption") or title).strip()
+    set_title = (candidate.get("title") or "").strip()
+    caption = (candidate.get("caption") or set_title or "DJ Clip").strip()
     hook_archetype = (candidate.get("hook_archetype") or "").strip().lower() or None
 
-    stem = f"{_safe_stem(title)}_{_safe_stem(str(start))}_{str(uuid.uuid4())[:8]}"
+    from ollama_caption import short_hook_overlay
+
+    # Burn the short hook into the short — never the full YouTube venue title.
+    overlay_title = short_hook_overlay(caption)
+
+    stem = f"{_safe_stem(overlay_title)}_{_safe_stem(str(start))}_{str(uuid.uuid4())[:8]}"
     out_path = workspace_dir() / "renders" / f"{stem}_fullscreen.mp4"
     segment = candidate.get("segment_path")
     segment_path = Path(segment) if segment and Path(segment).is_file() else None
@@ -144,7 +149,7 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
             youtube_url=youtube_url,
             start=start,
             end=end,
-            title=title,
+            title=overlay_title,
             out_path=out_path,
             segment_path=segment_path,
         )
@@ -181,7 +186,7 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
             clip_id=clip_id,
             youtube_url=youtube_url,
             storage_url=storage_url,
-            title=title,
+            title=overlay_title,
             caption=caption,
             start_time=start,
             end_time=end,

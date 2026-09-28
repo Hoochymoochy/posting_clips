@@ -21,16 +21,27 @@ def _run_main_py(args: list[str]) -> None:
         raise RuntimeError(err)
 
 
+def _append_title(args: list[str], title: str | None) -> None:
+    """Only burn text when a real overlay line is provided (skip venue titles)."""
+    cleaned = (title or "").strip()
+    if cleaned:
+        args.extend(["--title", cleaned])
+
+
 def render_preview(
     *,
     youtube_url: str,
     start: str,
     end: str,
-    title: str,
+    title: str | None = None,
     out_path: Path,
     segment_path: Path | None = None,
 ) -> Path:
-    """Cheap vertical preview (720p / --preview). GPU→CPU fallback inside main.py."""
+    """Cheap vertical preview (720p / --preview). GPU→CPU fallback inside main.py.
+
+    Pass ``title=None`` / empty to skip burned-in text so the review UI can
+    preview the hook overlay in CSS without stacking a venue title.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if segment_path is not None:
         segment_path.parent.mkdir(parents=True, exist_ok=True)
@@ -50,12 +61,12 @@ def render_preview(
         "--url", source,
         "--start", "00:00:00" if source != youtube_url else start,
         "--end", "99:59:59" if source != youtube_url else end,
-        "--title", title or "DJ Clip",
         "--output", str(out_path),
         "--mode", "fullscreen",
         "--max-res", "720",
         "--preview",
     ]
+    _append_title(render_args, title)
     _run_main_py(render_args)
     if not out_path.is_file():
         raise RuntimeError(f"Preview render produced no file: {out_path}")
@@ -78,11 +89,11 @@ def render_full(
         "--url", source,
         "--start", "00:00:00" if source != youtube_url else start,
         "--end", "99:59:59" if source != youtube_url else end,
-        "--title", title or "DJ Clip",
         "--output", str(out_path),
         "--mode", "fullscreen",
         "--max-res", "1080",
     ]
+    _append_title(render_args, title or "DJ Clip")
     _run_main_py(render_args)
     if not out_path.is_file():
         raise RuntimeError(f"Full render produced no file: {out_path}")

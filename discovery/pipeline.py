@@ -158,11 +158,12 @@ def process_run(run: dict[str, Any]) -> dict[str, Any]:
         preview_path = discovery_preview_path(candidate_id)
 
         try:
+            # Preview has no burned-in venue title — review UI shows the short hook in CSS.
             render_preview(
                 youtube_url=youtube_url,
                 start=start,
                 end=end,
-                title=video_title or "DJ Clip",
+                title=None,
                 out_path=preview_path,
                 segment_path=segment_path,
             )
