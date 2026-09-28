@@ -35,7 +35,10 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from logutil import init_logging
+
 load_dotenv()
+init_logging()
 
 # Ensure UTF-8 on Windows consoles
 if sys.platform == "win32":

@@ -47,8 +47,10 @@ from worker import (
     start_background_worker,
     stop_background_worker,
 )
+from logutil import init_logging
 
 load_dotenv()
+init_logging()
 
 # Ensure UTF-8 on Windows consoles
 if sys.platform == "win32":
