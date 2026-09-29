@@ -381,6 +381,36 @@ def process_clip(clip: dict, *, dry_run: bool, headless: bool, privacy: str) -> 
 
     video_path = resolve_video_path(storage_url, clip_id=clip_id)
     if not video_path:
+        # Studio inserts Supabase rows before the GPU render finishes. Leave
+        # channels pending so we retry once clips/{id}/clip.mp4 exists.
+        has_source = bool(
+            (clip.get("youtube_url") or "").strip()
+            and clip.get("start_time")
+            and clip.get("end_time")
+        )
+        if has_source:
+            print(
+                f"  [SKIP] Video not ready for {clip_id} "
+                f"(expected clips/{clip_id}/clip.mp4) — leaving channels pending."
+            )
+            try:
+                from studio_render import is_render_in_flight, render_and_store_clip_safe
+
+                if not is_render_in_flight(str(clip_id)):
+                    import threading
+
+                    threading.Thread(
+                        target=render_and_store_clip_safe,
+                        args=(str(clip_id),),
+                        kwargs={"force": False},
+                        daemon=True,
+                        name=f"studio-render-{clip_id}",
+                    ).start()
+                    print(f"  [studio-render] kicked off for {clip_id}")
+            except Exception as kick_err:
+                print(f"  [WARN] Could not kick studio render for {clip_id}: {kick_err}")
+            return
+
         err = (
             f"Video not found for clip {clip_id}. "
             f"Expected 'clips/{clip_id}/clip.mp4' or valid storage_url ({storage_url!r})."

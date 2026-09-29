@@ -22,6 +22,7 @@ Features:
       - POST /api/review/{id}/approve|decline
       - POST /api/update-queue
       - POST /api/studio/comments|caption  (Manual Clip Studio)
+      - POST /api/clips/{id}/render       (render YouTube window → clips/{id}/clip.mp4)
 """
 
 from __future__ import annotations
@@ -423,6 +424,98 @@ def get_clip_info(id: str):
             for c in channels
             if (c.get("status") or "").lower() in ("failed", "uncertain")
         ],
+    }
+
+
+@app.post("/api/clips/{id}/render", tags=["Clips"])
+@app.post("/clips/{id}/render", tags=["Clips"])
+def render_clip_route(
+    id: str,
+    force: bool = False,
+    wait: bool = False,
+):
+    """
+    Render a Studio/Supabase clip onto this host as clips/{id}/clip.mp4.
+
+    Studio inserts the metadata row first; call this so the poster worker has
+    a local video file. By default runs in a background thread (returns immediately).
+
+    Query params:
+      force=false  — re-render even if clip.mp4 already exists
+      wait=false   — if true, block until render finishes (debug / curl)
+    """
+    import threading
+
+    from db import get_clip_by_id, is_configured
+    from studio_render import is_render_in_flight, render_and_store_clip, render_and_store_clip_safe
+
+    clean_id = id.strip()
+    if not clean_id:
+        raise HTTPException(status_code=400, detail="Clip id cannot be empty.")
+    if not is_configured():
+        raise HTTPException(status_code=503, detail="Supabase is not configured.")
+
+    clip = get_clip_by_id(clean_id)
+    if not clip:
+        raise HTTPException(status_code=404, detail=f"Clip {clean_id} not found in Supabase.")
+    if not (clip.get("youtube_url") or "").strip():
+        raise HTTPException(status_code=400, detail="Clip has no youtube_url.")
+    if not clip.get("start_time") or not clip.get("end_time"):
+        raise HTTPException(status_code=400, detail="Clip is missing start_time/end_time.")
+
+    if is_render_in_flight(clean_id):
+        return {
+            "success": True,
+            "id": clean_id,
+            "status": "rendering",
+            "message": "Render already in progress.",
+        }
+
+    clips_dir = get_clips_dir()
+    existing = clips_dir / clean_id / "clip.mp4"
+    if existing.is_file() and not force:
+        storage_url = f"clips/{clean_id}/clip.mp4"
+        if not clip.get("storage_url"):
+            try:
+                from db import get_supabase
+
+                get_supabase().table("clips").update({"storage_url": storage_url}).eq(
+                    "id", clean_id
+                ).execute()
+            except Exception as e:
+                print(f"  [WARN] Could not set storage_url for {clean_id}: {e}")
+        return {
+            "success": True,
+            "id": clean_id,
+            "status": "ready",
+            "skipped": True,
+            "storage_url": storage_url,
+            "message": "Video already on disk.",
+        }
+
+    if wait:
+        try:
+            result = render_and_store_clip(clean_id, force=force)
+            return {**result, "status": "ready"}
+        except LookupError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
+
+    threading.Thread(
+        target=render_and_store_clip_safe,
+        args=(clean_id,),
+        kwargs={"force": force},
+        daemon=True,
+        name=f"studio-render-{clean_id}",
+    ).start()
+    return {
+        "success": True,
+        "id": clean_id,
+        "status": "rendering",
+        "message": "Render started in background. Video will appear under clips/{id}/clip.mp4.",
     }
 
 
