@@ -298,71 +298,6 @@ def retry_clip_platform(
     return result
 
 
-def retry_clip_all(
-    clip_id: str,
-    *,
-    force: bool = False,
-    immediate: bool = True,
-    dry_run: bool = False,
-    headless: bool = True,
-    privacy: str = "public",
-) -> dict[str, Any]:
-    """
-    Manually retry all failed (or uncertain) channels for a clip.
-    """
-    from db import (
-        get_clip_by_id,
-        mark_clip_posted,
-        update_channel,
-    )
-    from retry_state import clear_channel
-
-    clip = get_clip_by_id(clip_id)
-    if not clip:
-        raise LookupError(f"Clip not found: {clip_id}")
-
-    channels = clip.get("channels") or []
-    reset_channels: list[str] = []
-    for ch in channels:
-        status = (ch.get("status") or "").lower()
-        if status in ("failed", "uncertain") or force:
-            cid = str(ch["id"])
-            clear_channel(cid)
-            update_channel(cid, status="pending", error_message=None)
-            reset_channels.append(ch.get("platform"))
-
-    mark_clip_posted(clip_id, False)
-
-    result: dict[str, Any] = {
-        "success": True,
-        "clip_id": clip_id,
-        "reset_channels": reset_channels,
-        "posted_cleared": True,
-        "immediate": immediate,
-    }
-
-    if not immediate:
-        result["message"] = f"Reset {len(reset_channels)} channels to pending; worker will pick them up."
-        return result
-
-    fresh = get_clip_by_id(clip_id)
-    if not fresh:
-        raise RuntimeError("Clip disappeared after reset")
-
-    # Only include channels that were reset
-    fresh["channels"] = [
-        c for c in (fresh.get("channels") or [])
-        if (c.get("platform") or "").lower() in reset_channels
-    ]
-    print(f"\n[manual-retry-all] {clip_id} -> {reset_channels} (force={force})")
-    process_clip(fresh, dry_run=dry_run, headless=headless, privacy=privacy)
-
-    after = get_clip_by_id(clip_id)
-    result["channels"] = (after or {}).get("channels") or []
-    result["message"] = f"Immediate retry for {len(reset_channels)} channels finished."
-    return result
-
-
 def process_clip(clip: dict, *, dry_run: bool, headless: bool, privacy: str) -> None:
     import time as _time
 
@@ -445,52 +380,6 @@ def process_clip(clip: dict, *, dry_run: bool, headless: bool, privacy: str) -> 
         return
 
     video_path = resolve_video_path(storage_url, clip_id=clip_id)
-    if not video_path:
-        # Check if we have source YouTube URL and timestamps to render on demand (e.g. from Manual Studio)
-        yt_url = (clip.get("youtube_url") or "").strip()
-        start_t = (clip.get("start_time") or "").strip()
-        end_t = (clip.get("end_time") or "").strip()
-
-        if yt_url and yt_url != "https://youtube.com/shorts/local_upload" and start_t and end_t:
-            print(f"  [RENDER] Video not found locally, but source {yt_url} ({start_t} -> {end_t}) provided.")
-            print(f"  [RENDER] Rendering 9:16 vertical short for clip {clip_id} now...")
-            try:
-                import shutil
-                from discovery.render import render_full
-                from discovery.paths import workspace_dir
-                from ollama_caption import short_hook_overlay
-
-                overlay_title = title or short_hook_overlay(caption)
-                stem = f"manual_{clip_id[:8]}"
-                out_path = workspace_dir() / "renders" / f"{stem}_fullscreen.mp4"
-
-                render_full(
-                    youtube_url=yt_url,
-                    start=start_t,
-                    end=end_t,
-                    title=overlay_title,
-                    out_path=out_path,
-                )
-
-                dest_folder = get_clips_dir() / clip_id
-                dest_folder.mkdir(parents=True, exist_ok=True)
-                dest_video = dest_folder / "clip.mp4"
-                shutil.copy2(out_path, dest_video)
-
-                rel_storage = f"clips/{clip_id}/clip.mp4"
-                video_path = str(dest_video.resolve())
-
-                # Update storage_url in Supabase
-                try:
-                    from db import get_supabase
-                    get_supabase().table("clips").update({"storage_url": rel_storage}).eq("id", clip_id).execute()
-                except Exception as db_err:
-                    print(f"  [WARN] Failed to update storage_url in Supabase: {db_err}")
-
-                print(f"  [RENDER] Successfully rendered {video_path}")
-            except Exception as render_err:
-                print(f"  [RENDER FAIL] Could not render clip {clip_id}: {render_err}")
-
     if not video_path:
         err = (
             f"Video not found for clip {clip_id}. "

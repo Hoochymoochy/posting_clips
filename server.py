@@ -463,41 +463,6 @@ def retry_clip_platform_route(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-@app.post("/api/clips/{id}/retry", tags=["Clips"])
-@app.post("/clips/{id}/retry", tags=["Clips"])
-def retry_clip_all_route(
-    id: str,
-    force: bool = False,
-    immediate: bool = True,
-):
-    """
-    Retry all failed/uncertain channels for a clip.
-
-    Query params:
-      force=false     — required to retry success/processing channels too
-      immediate=true  — run upload now; if false, just reset to pending for worker
-
-    Example: POST /api/clips/{id}/retry
-    """
-    from worker import retry_clip_all
-
-    try:
-        return retry_clip_all(
-            id.strip(),
-            force=force,
-            immediate=immediate,
-            dry_run=DRY_RUN,
-            headless=HEADLESS,
-            privacy=YOUTUBE_PRIVACY,
-        )
-    except LookupError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
 @app.get("/api/clips", tags=["Clips"])
 @app.get("/clips", tags=["Clips"])
 def list_clips():
