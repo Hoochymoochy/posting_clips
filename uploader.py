@@ -333,7 +333,11 @@ def validate_video_for_shorts(video_path: str) -> tuple[bool, list[str]]:
 
 
 def build_caption(title: str, custom_caption: str = "", tags: list[str] | None = None) -> tuple[str, str, list[str]]:
-    """Build platform-optimized title, description/caption, and tags.
+    """Build platform-optimized YouTube title, description/caption, and tags.
+
+    Contract (matches Studio + Supabase columns):
+      - ``title`` = on-video hook → YouTube Short *title*
+      - ``custom_caption`` = social caption → YouTube *description* (and IG/TT caption)
 
     Always appends default DJ hashtags at the end of the caption so the user
     only needs to write the sentence — tags are added automatically.
@@ -347,7 +351,8 @@ def build_caption(title: str, custom_caption: str = "", tags: list[str] | None =
     clean_tags = [t if t.startswith("#") else f"#{t}" for t in tag_list]
     raw_tag_keywords = [t.lstrip("#") for t in clean_tags]
 
-    body = (custom_caption or title or "").rstrip()
+    hook = (title or "").strip()
+    body = (custom_caption or "").strip() or hook
     body_lower = body.lower()
 
     # Only append tags that are not already in the caption
@@ -361,7 +366,13 @@ def build_caption(title: str, custom_caption: str = "", tags: list[str] | None =
     else:
         full_caption = " ".join(clean_tags)
 
-    yt_title = f"{title} #Shorts" if title and "#shorts" not in title.lower() else (title or "DJ Set Clip #Shorts")
+    # YouTube title = on-video hook (not the social caption / description)
+    if hook and "#shorts" not in hook.lower():
+        yt_title = f"{hook} #Shorts"
+    elif hook:
+        yt_title = hook
+    else:
+        yt_title = "DJ Set Clip #Shorts"
 
     return yt_title, full_caption, raw_tag_keywords
 

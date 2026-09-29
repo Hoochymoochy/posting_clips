@@ -82,13 +82,18 @@ def render_and_store_clip(clip_id: str, *, force: bool = False) -> dict[str, Any
         if not clip.get("start_time") or not clip.get("end_time"):
             raise ValueError(f"Clip {clean_id} is missing start_time/end_time")
 
-        caption = (clip.get("caption") or clip.get("title") or "DJ Clip").strip()
-        overlay_title = short_hook_overlay(caption)
+        # On-video hook is clips.title (Studio "On-video hook" field). That same
+        # value is the YouTube Short title — never re-derive from caption or the
+        # hook/description get swapped at publish time.
+        hook = (clip.get("title") or "").strip()
+        caption = (clip.get("caption") or "").strip()
+        overlay_title = hook or short_hook_overlay(caption or "DJ Clip")
 
         stem = f"{_safe_stem(overlay_title)}_{_safe_stem(str(start))}_{uuid.uuid4().hex[:8]}"
         out_path = workspace_dir() / "renders" / f"{stem}_studio.mp4"
 
         print(f"  [studio-render] {clean_id} {youtube_url} [{start} → {end}]")
+        print(f"  [studio-render] overlay={overlay_title!r} caption={(caption[:60] + '…') if len(caption) > 60 else caption!r}")
         render_full(
             youtube_url=youtube_url,
             start=start,
