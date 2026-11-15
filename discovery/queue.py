@@ -1,6 +1,9 @@
 """
 discovery/queue.py — Pull DJ-set URLs from Braindance and enqueue into discovery_runs.
 
+Only recent uploads are enqueued (DISCOVERY_SET_MAX_AGE_DAYS). Stale pending runs
+and untouched review candidates are auto-expired each cron tick.
+
 Only inserts URLs that are not already present in discovery_runs (any status).
 Does not apply the daily run cap — that only gates create_run when work starts.
 """
@@ -11,13 +14,80 @@ import json
 import os
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 DEFAULT_DJ_SET_FEED_URL = "https://braindance.hoochymoochy.xyz/dj-sets"
 
+# Only enqueue YouTube sets published within this many days (fresh uploads).
+DEFAULT_SET_MAX_AGE_DAYS = 7
+
 
 def get_dj_set_feed_url() -> str:
     return os.environ.get("DJ_SET_FEED_URL", DEFAULT_DJ_SET_FEED_URL).strip() or DEFAULT_DJ_SET_FEED_URL
+
+
+def get_set_max_age_days() -> float:
+    raw = os.environ.get("DISCOVERY_SET_MAX_AGE_DAYS")
+    if raw is None or str(raw).strip() == "":
+        return float(DEFAULT_SET_MAX_AGE_DAYS)
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return float(DEFAULT_SET_MAX_AGE_DAYS)
+
+
+def _parse_iso_dt(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def set_upload_time(item: dict[str, Any]) -> datetime | None:
+    """Prefer YouTube published_at; fall back to Braindance fetched_at."""
+    return _parse_iso_dt(item.get("published_at")) or _parse_iso_dt(item.get("fetched_at"))
+
+
+def filter_recent_sets(
+    sets: list[dict[str, Any]],
+    *,
+    max_age_days: float | None = None,
+    now: datetime | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """
+    Keep sets uploaded within max_age_days. Drops items with no usable date.
+
+    Returns (kept_newest_first, dropped_count).
+    """
+    days = get_set_max_age_days() if max_age_days is None else max(0.0, float(max_age_days))
+    if days <= 0:
+        # 0 = disable age filter (legacy full-feed behavior)
+        return list(sets), 0
+
+    anchor = now or datetime.now(timezone.utc)
+    if anchor.tzinfo is None:
+        anchor = anchor.replace(tzinfo=timezone.utc)
+    else:
+        anchor = anchor.astimezone(timezone.utc)
+    cutoff = anchor - timedelta(days=days)
+
+    kept: list[tuple[datetime, dict[str, Any]]] = []
+    dropped = 0
+    for item in sets:
+        uploaded = set_upload_time(item)
+        if uploaded is None or uploaded < cutoff:
+            dropped += 1
+            continue
+        kept.append((uploaded, item))
+
+    kept.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in kept], dropped
 
 
 def fetch_dj_sets(feed_url: str | None = None, *, timeout: float = 30.0) -> list[dict[str, Any]]:
@@ -116,12 +186,73 @@ def enqueue_urls(supabase, urls: list[str]) -> dict[str, Any]:
     }
 
 
+def cancel_stale_pending_runs(
+    supabase,
+    *,
+    recent_urls: set[str] | None = None,
+    max_age_days: float | None = None,
+    now: datetime | None = None,
+) -> dict[str, int]:
+    """
+    Fail pending discovery_runs that are no longer fresh.
+
+    A pending run is cancelled when:
+      - its youtube_url is not in the current recent feed set, or
+      - the row itself is older than DISCOVERY_SET_MAX_AGE_DAYS
+    """
+    days = get_set_max_age_days() if max_age_days is None else max(0.0, float(max_age_days))
+    if days <= 0 and not recent_urls:
+        return {"checked": 0, "cancelled": 0}
+
+    anchor = now or datetime.now(timezone.utc)
+    if anchor.tzinfo is None:
+        anchor = anchor.replace(tzinfo=timezone.utc)
+    else:
+        anchor = anchor.astimezone(timezone.utc)
+    cutoff = anchor - timedelta(days=days) if days > 0 else None
+
+    result = (
+        supabase.table("discovery_runs")
+        .select("id, youtube_url, created_at, status")
+        .eq("status", "pending")
+        .execute()
+    )
+    rows = list(result.data or [])
+    cancelled = 0
+    stamp = anchor.isoformat()
+
+    for row in rows:
+        url = (row.get("youtube_url") or "").strip()
+        created = _parse_iso_dt(row.get("created_at"))
+        stale_url = recent_urls is not None and url and url not in recent_urls
+        stale_age = cutoff is not None and (created is None or created < cutoff)
+        if not (stale_url or stale_age):
+            continue
+        (
+            supabase.table("discovery_runs")
+            .update({"status": "failed", "updated_at": stamp})
+            .eq("id", row["id"])
+            .eq("status", "pending")
+            .execute()
+        )
+        cancelled += 1
+
+    return {"checked": len(rows), "cancelled": cancelled}
+
+
 def update_queue(supabase, feed_url: str | None = None) -> dict[str, Any]:
-    """Fetch DJ-set feed and enqueue any new URLs into discovery_runs."""
+    """Fetch DJ-set feed, keep recent uploads only, enqueue new URLs, cancel stale pending."""
     sets = fetch_dj_sets(feed_url)
-    urls = extract_urls(sets)
+    recent, dropped = filter_recent_sets(sets)
+    urls = extract_urls(recent)
     stats = enqueue_urls(supabase, urls)
+    cancel_stats = cancel_stale_pending_runs(supabase, recent_urls=set(urls))
     stats["feed_url"] = feed_url or get_dj_set_feed_url()
+    stats["feed_total"] = len(sets)
+    stats["recent"] = len(recent)
+    stats["dropped_old"] = dropped
+    stats["max_age_days"] = get_set_max_age_days()
+    stats["cancelled_pending"] = cancel_stats["cancelled"]
     return stats
 
 
@@ -133,14 +264,18 @@ def run_cron_cycle(
     max_runs: int = 1,
 ) -> dict[str, Any]:
     """
-    One cron tick: refresh discovery_runs from Braindance, then process pending work.
+    One cron tick: expire stale reviews, refresh recent Braindance sets, process work.
 
     process=True runs the discovery pipeline (Ollama + GPU preview / approvals)
     up to max_runs claimed discovery_runs (plus any approved full-renders each cycle).
     """
+    from discovery.candidates import expire_stale_awaiting_review
+
+    expired = expire_stale_awaiting_review(supabase)
     queue_stats = update_queue(supabase, feed_url=feed_url)
     result: dict[str, Any] = {
         "success": True,
+        "expired_reviews": expired,
         "queue": queue_stats,
         "processed": [],
     }
@@ -211,9 +346,22 @@ def main() -> None:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
+    from discovery.candidates import get_review_max_age_days
+
+    expired = result.get("expired_reviews") or {}
+    if expired.get("expired"):
+        print(f"expired_reviews={expired['expired']} (age>{get_review_max_age_days()}d)")
+
     stats = result["queue"]
     print(
-        f"fetched={stats['fetched']}  inserted={stats['inserted']}  skipped={stats['skipped']}"
+        f"feed_total={stats.get('feed_total', stats['fetched'])}  "
+        f"recent={stats.get('recent', stats['fetched'])}  "
+        f"dropped_old={stats.get('dropped_old', 0)}  "
+        f"max_age_days={stats.get('max_age_days', get_set_max_age_days())}"
+    )
+    print(
+        f"inserted={stats['inserted']}  skipped={stats['skipped']}  "
+        f"cancelled_pending={stats.get('cancelled_pending', 0)}"
     )
     for url in stats.get("inserted_urls") or []:
         print(f"  + {url}")

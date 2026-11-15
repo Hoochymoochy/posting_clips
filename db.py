@@ -88,6 +88,9 @@ def fetch_due_clips(limit: int = 10) -> list[dict[str, Any]]:
     due: list[dict[str, Any]] = []
     now = datetime.now(timezone.utc)
     for clip in result.data or []:
+        # Download-only clips have no channel rows — never hand them to the poster.
+        if not (clip.get("channels") or []):
+            continue
         scheduled = clip.get("scheduled_at")
         if scheduled is None:
             due.append(clip)
@@ -224,25 +227,30 @@ def register_clip(
     clip = clip_res.data[0]
     target_id = clip["id"]
 
+    # Download-only by default: only create channel rows when platforms are
+    # explicitly requested. Empty / None → no social queue rows.
     allowed = {"youtube", "instagram", "tiktok"}
     platforms = [p.lower().strip() for p in (platforms or []) if p]
     platforms = [p for p in platforms if p in allowed]
-    if not platforms:
-        platforms = ["youtube", "instagram", "tiktok"]
 
-    channel_rows = [
-        {
-            "clip_id": target_id,
-            "platform": p,
-            "status": "pending",
-        }
-        for p in platforms
-    ]
-    channels_res = client.table("channels").upsert(channel_rows, on_conflict="clip_id,platform").execute()
+    channels: list[dict[str, Any]] = []
+    if platforms:
+        channel_rows = [
+            {
+                "clip_id": target_id,
+                "platform": p,
+                "status": "pending",
+            }
+            for p in platforms
+        ]
+        channels_res = client.table("channels").upsert(
+            channel_rows, on_conflict="clip_id,platform"
+        ).execute()
+        channels = list(channels_res.data or [])
 
     return {
         "clip": clip,
-        "channels": list(channels_res.data or []),
+        "channels": channels,
     }
 
 

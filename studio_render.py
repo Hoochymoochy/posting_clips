@@ -9,17 +9,35 @@ from __future__ import annotations
 
 import shutil
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
 
 _lock = threading.Lock()
 _in_flight: set[str] = set()
+# clip_id → {status: rendering|ready|failed, error?: str, updated_at: float}
+_status: dict[str, dict[str, Any]] = {}
 
 
 def is_render_in_flight(clip_id: str) -> bool:
     with _lock:
         return clip_id in _in_flight
+
+
+def get_render_status(clip_id: str) -> dict[str, Any] | None:
+    with _lock:
+        row = _status.get((clip_id or "").strip())
+        return dict(row) if row else None
+
+
+def _set_status(clip_id: str, status: str, error: str | None = None) -> None:
+    with _lock:
+        _status[clip_id] = {
+            "status": status,
+            "error": (error or None),
+            "updated_at": time.time(),
+        }
 
 
 def _safe_stem(text: str, max_len: int = 40) -> str:
@@ -38,7 +56,6 @@ def render_and_store_clip(clip_id: str, *, force: bool = False) -> dict[str, Any
     from db import get_clip_by_id, get_supabase, is_configured
     from discovery.paths import workspace_dir
     from discovery.render import render_full
-    from ollama_caption import short_hook_overlay
     from worker import get_clips_dir
 
     clean_id = (clip_id or "").strip()
@@ -51,6 +68,7 @@ def render_and_store_clip(clip_id: str, *, force: bool = False) -> dict[str, Any
         if clean_id in _in_flight:
             raise RuntimeError(f"Clip {clean_id} is already rendering")
         _in_flight.add(clean_id)
+    _set_status(clean_id, "rendering")
 
     try:
         clip = get_clip_by_id(clean_id)
@@ -65,6 +83,7 @@ def render_and_store_clip(clip_id: str, *, force: bool = False) -> dict[str, Any
                 get_supabase().table("clips").update({"storage_url": storage_url}).eq(
                     "id", clean_id
                 ).execute()
+            _set_status(clean_id, "ready")
             return {
                 "success": True,
                 "id": clean_id,
@@ -82,23 +101,17 @@ def render_and_store_clip(clip_id: str, *, force: bool = False) -> dict[str, Any
         if not clip.get("start_time") or not clip.get("end_time"):
             raise ValueError(f"Clip {clean_id} is missing start_time/end_time")
 
-        # On-video hook is clips.title (Studio "On-video hook" field). That same
-        # value is the YouTube Short title — never re-derive from caption or the
-        # hook/description get swapped at publish time.
-        hook = (clip.get("title") or "").strip()
-        caption = (clip.get("caption") or "").strip()
-        overlay_title = hook or short_hook_overlay(caption or "DJ Clip")
-
-        stem = f"{_safe_stem(overlay_title)}_{_safe_stem(str(start))}_{uuid.uuid4().hex[:8]}"
+        # Clean render only — on-video hooks are added later in the Editor.
+        stem = f"clip_{_safe_stem(str(start))}_{uuid.uuid4().hex[:8]}"
         out_path = workspace_dir() / "renders" / f"{stem}_studio.mp4"
 
         print(f"  [studio-render] {clean_id} {youtube_url} [{start} → {end}]")
-        print(f"  [studio-render] overlay={overlay_title!r} caption={(caption[:60] + '…') if len(caption) > 60 else caption!r}")
+        print(f"  [studio-render] no baked overlay (Editor owns hooks)")
         render_full(
             youtube_url=youtube_url,
             start=start,
             end=end,
-            title=overlay_title,
+            title="",
             out_path=out_path,
         )
 
@@ -111,6 +124,7 @@ def render_and_store_clip(clip_id: str, *, force: bool = False) -> dict[str, Any
         ).execute()
 
         print(f"  [studio-render] done {clean_id} -> {dest_video}")
+        _set_status(clean_id, "ready")
         return {
             "success": True,
             "id": clean_id,
@@ -118,8 +132,11 @@ def render_and_store_clip(clip_id: str, *, force: bool = False) -> dict[str, Any
             "message": f"Clip {clean_id} rendered and stored.",
             "storage_url": storage_url,
             "video_path": str(dest_video),
-            "overlay_title": overlay_title,
+            "overlay_title": "",
         }
+    except Exception as exc:
+        _set_status(clean_id, "failed", str(exc))
+        raise
     finally:
         with _lock:
             _in_flight.discard(clean_id)
@@ -130,4 +147,6 @@ def render_and_store_clip_safe(clip_id: str, *, force: bool = False) -> None:
     try:
         render_and_store_clip(clip_id, force=force)
     except Exception as exc:
-        print(f"  [studio-render] FAILED {clip_id}: {exc}")
+        msg = str(exc)
+        _set_status((clip_id or "").strip(), "failed", msg)
+        print(f"  [studio-render] FAILED {clip_id}: {msg}")

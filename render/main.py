@@ -341,6 +341,22 @@ def detect_best_encoder(force_cpu: bool = False, *, preview: bool = False) -> tu
     return "CPU (libx264)", ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
 
 
+def _ytdlp_bin() -> list[str]:
+    """Prefer `python -m yt_dlp` (same interpreter as this process) over PATH exe."""
+    return [sys.executable, "-m", "yt_dlp"]
+
+
+def _parse_hms(ts: str) -> float:
+    parts = [float(p) for p in (ts or "0").strip().split(":")]
+    if len(parts) == 3:
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    if len(parts) == 2:
+        return parts[0] * 60 + parts[1]
+    if len(parts) == 1:
+        return parts[0]
+    return 0.0
+
+
 def download_clip(url: str, start: str, end: str, workdir: str, max_res: str = "1080", audio_only: bool = False) -> str:
     """Download only the requested section of the video or audio with yt-dlp or trim a local file."""
     # Support using a local video/audio file directly
@@ -365,52 +381,168 @@ def download_clip(url: str, start: str, end: str, workdir: str, max_res: str = "
     target_url = clean_youtube_url(url)
     out_template = os.path.join(workdir, "raw.%(ext)s")
     section = f"*{start}-{end}"
+    log_path = os.path.join(workdir, "ytdlp.log")
 
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-    ]
+    base_cmd = [*_ytdlp_bin(), "--no-playlist", "--newline", "--no-color"]
 
     # YouTube blocks datacenter IPs ("Sign in to confirm you're not a bot").
-    # When a cookies.txt from a logged-in browser is available, use it.
     cookies_file = os.environ.get("YT_COOKIES_FILE", "").strip()
     if cookies_file and os.path.isfile(cookies_file):
-        cmd.extend(["--cookies", cookies_file])
+        base_cmd.extend(["--cookies", cookies_file])
 
-    # Use node or deno if installed to solve YouTube JavaScript challenges and suppress runtime warnings
-    if shutil.which("deno"):
-        cmd.extend(["--js-runtimes", "deno", "--remote-components", "ejs:github"])
-    elif shutil.which("node"):
-        cmd.extend(["--js-runtimes", "node", "--remote-components", "ejs:github"])
-
-    # Explicitly pass ffmpeg location so yt-dlp has it for partial section cuts
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path:
-        cmd.extend(["--ffmpeg-location", os.path.dirname(ffmpeg_path)])
+        base_cmd.extend(["--ffmpeg-location", os.path.dirname(ffmpeg_path)])
 
     if audio_only:
-        # Download best audio stream only (fastest download, skips video completely)
         format_selector = "ba[ext=m4a]/ba"
     elif max_res and max_res.lower() != "max":
-        format_selector = f"bv*[height<={max_res}][ext=mp4]+ba[ext=m4a]/bv*[height<={max_res}]+ba/b[height<={max_res}]/bv*+ba/b"
+        format_selector = (
+            f"bv*[height<={max_res}][ext=mp4]+ba[ext=m4a]/"
+            f"bv*[height<={max_res}]+ba/b[height<={max_res}]/bv*+ba/b"
+        )
     else:
         format_selector = "bv*[ext=mp4]+ba[ext=m4a]/mp4/bv*+ba/b"
 
-    cmd.extend([
-        "-f", format_selector,
-        "--download-sections", section,
-        "--force-keyframes-at-cuts",
-        "-o", out_template,
-        target_url,
-    ])
-    print("Downloading clip:", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    def _find_raw():
+        for f in os.listdir(workdir):
+            if f.startswith("raw."):
+                return os.path.join(workdir, f)
+        return None
 
-    # Find whatever file yt-dlp produced
-    for f in os.listdir(workdir):
-        if f.startswith("raw."):
-            return os.path.join(workdir, f)
-    sys.exit("Download failed: no output file found.")
+    def _clear_raw():
+        for f in os.listdir(workdir):
+            if f.startswith("raw."):
+                try:
+                    os.remove(os.path.join(workdir, f))
+                except OSError:
+                    pass
+
+    def _run_ytdlp(extra, label: str) -> None:
+        full_cmd = [*base_cmd, *extra, "-o", out_template, target_url]
+        print(f"Downloading clip ({label}):", " ".join(full_cmd))
+        with open(log_path, "w", encoding="utf-8", errors="replace") as logf:
+            proc = subprocess.run(
+                full_cmd,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as logf:
+                log_text = logf.read()
+        except OSError:
+            log_text = ""
+        if log_text.strip():
+            print(log_text[-4000:])
+        if proc.returncode != 0:
+            # Prefer the last ERROR/WARNING line for a readable message
+            useful = [
+                ln.strip()
+                for ln in log_text.splitlines()
+                if ln.strip()
+                and ("ERROR" in ln.upper() or "ERROR:" in ln or "Unable" in ln or "HTTP Error" in ln)
+            ]
+            detail = useful[-1] if useful else (log_text.strip()[-800] or f"yt-dlp exited {proc.returncode}")
+            raise RuntimeError(detail)
+
+    js_flags = []
+    if shutil.which("deno"):
+        js_flags = ["--js-runtimes", "deno", "--remote-components", "ejs:github"]
+    elif shutil.which("node"):
+        js_flags = ["--js-runtimes", "node", "--remote-components", "ejs:github"]
+
+    attempts = [
+        ("section+keyframes", [*js_flags, "-f", format_selector, "--download-sections", section, "--force-keyframes-at-cuts"]),
+        ("section", [*js_flags, "-f", format_selector, "--download-sections", section]),
+        ("section-simple", [*js_flags, "-f", f"b[height<={max_res}]/b/bv*+ba/b", "--download-sections", section]),
+        # No JS challenge solver (sometimes remote-components fails under the server)
+        ("section-nojs", ["-f", format_selector, "--download-sections", section]),
+    ]
+
+    last_err = None
+    for i, (label, extra) in enumerate(attempts, start=1):
+        try:
+            _clear_raw()
+            _run_ytdlp(extra, label)
+            found = _find_raw()
+            if found:
+                return found
+            last_err = RuntimeError("yt-dlp finished but no raw.* file was produced")
+        except Exception as exc:
+            last_err = exc
+            print(f"  [download] attempt {i}/{len(attempts)} ({label}) failed: {exc}")
+
+    # Final fallback: resolve stream URL(s) and cut with ffmpeg (-ss/-to). Reliable on Windows.
+    if not audio_only:
+        try:
+            _clear_raw()
+            print("Downloading clip (ffmpeg-fallback): resolve stream URL + ffmpeg trim")
+            g_cmd = [*_ytdlp_bin(), "--no-playlist", *js_flags]
+            if cookies_file and os.path.isfile(cookies_file):
+                g_cmd.extend(["--cookies", cookies_file])
+            g_cmd.extend(["-f", format_selector, "-g", target_url])
+            g_proc = subprocess.run(
+                g_cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            urls = [ln.strip() for ln in (g_proc.stdout or "").splitlines() if ln.strip()]
+            if g_proc.returncode != 0 or not urls:
+                raise RuntimeError(
+                    ((g_proc.stderr or g_proc.stdout or "yt-dlp -g failed").strip())[-800]
+                )
+
+            out_mp4 = os.path.join(workdir, "raw.mp4")
+            start_sec = _parse_hms(start)
+            end_sec = _parse_hms(end)
+            duration = max(0.1, end_sec - start_sec)
+
+            if len(urls) >= 2:
+                ff = [
+                    "ffmpeg", "-y",
+                    "-ss", str(start_sec),
+                    "-i", urls[0],
+                    "-ss", str(start_sec),
+                    "-i", urls[1],
+                    "-t", str(duration),
+                    "-map", "0:v:0", "-map", "1:a:0",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-shortest",
+                    out_mp4,
+                ]
+            else:
+                ff = [
+                    "ffmpeg", "-y",
+                    "-ss", str(start_sec),
+                    "-i", urls[0],
+                    "-t", str(duration),
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                    "-c:a", "aac", "-b:a", "192k",
+                    out_mp4,
+                ]
+            print("ffmpeg trim:", " ".join(ff[:8]), "…")
+            ff_proc = subprocess.run(
+                ff,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if ff_proc.returncode != 0 or not os.path.isfile(out_mp4):
+                err = (ff_proc.stderr or ff_proc.stdout or "ffmpeg trim failed").strip()
+                raise RuntimeError(err[-800:])
+            return out_mp4
+        except Exception as exc:
+            last_err = exc
+            print(f"  [download] ffmpeg-fallback failed: {exc}")
+
+    raise RuntimeError(str(last_err) if last_err else "Download failed")
 
 
 def extract_audio(input_path: str, output_path: str, audio_format: str = "mp3", title: str = ""):

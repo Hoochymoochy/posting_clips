@@ -221,11 +221,20 @@ def process_approvals() -> int:
 
 
 def process_once() -> dict[str, Any]:
+    from discovery.candidates import expire_stale_awaiting_review
     from discovery.limiter import claim_next_pending_run
+    from discovery.queue import cancel_stale_pending_runs
     from db import get_supabase, is_configured
 
     if not is_configured():
         raise RuntimeError("Supabase is not configured (SUPABASE_URL / key in .env).")
+
+    sb = get_supabase()
+    try:
+        expire_stale_awaiting_review(sb)
+        cancel_stale_pending_runs(sb)
+    except Exception as exc:
+        print(f"  [WARN] freshness cleanup failed: {exc}")
 
     try:
         n = process_approvals()
@@ -234,7 +243,6 @@ def process_once() -> dict[str, Any]:
     except Exception as exc:
         print(f"  [WARN] approval cycle failed: {exc}")
 
-    sb = get_supabase()
     run = claim_next_pending_run(sb)
     if not run:
         print("No pending discovery runs (or daily cap reached).")

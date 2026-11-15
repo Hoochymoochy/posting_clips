@@ -6,8 +6,9 @@ Features:
   1. Video ingestion API:
      - Stores received videos in: clips/[id]/clip.mp4
      - Caption / title / tags live in Supabase (not metadata.json)
-  2. Background posting worker (ENABLE_BACKGROUND_WORKER):
+  2. Background posting worker (ENABLE_BACKGROUND_WORKER, default off):
      - Polls Supabase for due clips and posts to social platforms
+     - Download-only mode leaves this disabled; use Studio → Download instead
   3. Discovery pipeline (ENABLE_DISCOVERY_WORKER):
      - Claims discovery_runs, Ollama captions, GPU/CPU previews + full renders
      - Review APIs for the Vercel web app
@@ -69,7 +70,8 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "5"))
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() in ("1", "true", "yes")
 HEADLESS = os.environ.get("HEADED", "false").lower() not in ("1", "true", "yes")
 YOUTUBE_PRIVACY = os.environ.get("YOUTUBE_PRIVACY", "public")
-ENABLE_WORKER = os.environ.get("ENABLE_BACKGROUND_WORKER", "true").lower() in ("1", "true", "yes")
+# Download-only default: do not auto-post to socials unless explicitly re-enabled.
+ENABLE_WORKER = os.environ.get("ENABLE_BACKGROUND_WORKER", "false").lower() in ("1", "true", "yes")
 ENABLE_DISCOVERY = os.environ.get("ENABLE_DISCOVERY_WORKER", "true").lower() in ("1", "true", "yes")
 DISCOVERY_POLL_SECONDS = int(os.environ.get("DISCOVERY_POLL_SECONDS", "120"))
 ENABLE_ANALYTICS = os.environ.get("ENABLE_ANALYTICS_WORKER", "false").lower() in ("1", "true", "yes")
@@ -407,6 +409,23 @@ def get_clip_info(id: str):
         raise HTTPException(status_code=404, detail=f"Clip {id} not found in {clips_dir} or Supabase.")
 
     channels = (supabase_clip or {}).get("channels") or []
+
+    render_status = None
+    render_error = None
+    try:
+        from studio_render import get_render_status, is_render_in_flight
+
+        tracked = get_render_status(id.strip())
+        if tracked:
+            render_status = tracked.get("status")
+            render_error = tracked.get("error")
+        elif is_render_in_flight(id.strip()):
+            render_status = "rendering"
+        elif has_video:
+            render_status = "ready"
+    except Exception as e:
+        print(f"  [WARN] render status lookup failed: {e}")
+
     return {
         "id": id,
         "folder": str(folder) if folder.is_dir() else None,
@@ -419,12 +438,59 @@ def get_clip_info(id: str):
         "posted": (supabase_clip or {}).get("posted"),
         "scheduled_at": (supabase_clip or {}).get("scheduled_at"),
         "channels": channels,
+        "render_status": render_status,
+        "render_error": render_error,
+        "ready": has_video,
         "failed_platforms": [
             (c.get("platform") or "").lower()
             for c in channels
             if (c.get("status") or "").lower() in ("failed", "uncertain")
         ],
     }
+
+
+def _clip_mp4_path(clip_id: str) -> Path | None:
+    """Return path to clips/{id}/clip.mp4 when it exists on disk."""
+    video = get_clips_dir() / clip_id.strip() / "clip.mp4"
+    return video if video.is_file() else None
+
+
+@app.get("/api/clips/{id}/download", tags=["Clips"])
+@app.get("/clips/{id}/download", tags=["Clips"])
+def download_clip_video(id: str, inline: bool = False):
+    """
+    Stream the rendered MP4 for download (or inline playback when inline=true).
+    """
+    clean_id = id.strip()
+    path = _clip_mp4_path(clean_id)
+    if not path:
+        raise HTTPException(status_code=404, detail=f"Rendered video not found for clip {clean_id}")
+
+    disposition = "inline" if inline else "attachment"
+    filename = f"{clean_id}.mp4"
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        filename=filename,
+        content_disposition_type=disposition,
+        headers={"Cache-Control": "private, max-age=60"},
+    )
+
+
+@app.get("/clips/{id}/clip.mp4", tags=["Clips"])
+def serve_clip_mp4(id: str):
+    """Serve rendered MP4 at the canonical storage_url path (for <video> preview)."""
+    clean_id = id.strip()
+    path = _clip_mp4_path(clean_id)
+    if not path:
+        raise HTTPException(status_code=404, detail=f"Rendered video not found for clip {clean_id}")
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        filename=f"{clean_id}.mp4",
+        content_disposition_type="inline",
+        headers={"Cache-Control": "private, max-age=60"},
+    )
 
 
 @app.post("/api/clips/{id}/render", tags=["Clips"])
@@ -437,8 +503,8 @@ def render_clip_route(
     """
     Render a Studio/Supabase clip onto this host as clips/{id}/clip.mp4.
 
-    Studio inserts the metadata row first; call this so the poster worker has
-    a local video file. By default runs in a background thread (returns immediately).
+    Studio inserts the metadata row first; call this so the file is ready to
+    download. By default runs in a background thread (returns immediately).
 
     Query params:
       force=false  — re-render even if clip.mp4 already exists

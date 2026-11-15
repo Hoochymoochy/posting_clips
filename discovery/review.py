@@ -110,7 +110,6 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
     """
     from discovery.candidates import (
         get_candidate,
-        next_scheduled_at,
         update_candidate,
     )
     from discovery.paths import workspace_dir
@@ -153,7 +152,6 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
             out_path=out_path,
             segment_path=segment_path,
         )
-        scheduled_at = next_scheduled_at(supabase)
         clip_id = str(uuid.uuid4())
         dest_folder = get_clips_dir() / clip_id
         dest_folder.mkdir(parents=True, exist_ok=True)
@@ -182,6 +180,8 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
                 pass
 
         storage_url = f"clips/{clip_id}/clip.mp4"
+        # Download-only: register the rendered file with no social channel rows
+        # and no publish schedule (manual download from Studio / My Clips).
         db_result = register_clip(
             clip_id=clip_id,
             youtube_url=youtube_url,
@@ -190,7 +190,8 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
             caption=caption,
             start_time=start,
             end_time=end,
-            scheduled_at=scheduled_at,
+            scheduled_at=None,
+            platforms=[],
             hook_archetype=hook_archetype,
             duration_seconds=duration_seconds,
         )
@@ -199,12 +200,12 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
             candidate_id,
             status="queued",
             clip_id=clip_id,
-            scheduled_at=scheduled_at,
+            scheduled_at=None,
         )
         return {
             "candidate": updated,
             "clip_id": clip_id,
-            "scheduled_at": scheduled_at,
+            "scheduled_at": None,
             "video_path": str(dest_video),
             "supabase": db_result,
         }

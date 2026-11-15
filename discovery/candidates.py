@@ -23,9 +23,22 @@ DISCOVERY_CANDIDATE_STATUSES = (
     "needs_caption",
 )
 
+# Untouched Discover suggestions older than this are auto-declined as expired.
+DEFAULT_REVIEW_MAX_AGE_DAYS = 2
+
 # Random gap from the last post/schedule (minute precision) to avoid exact cadence.
 MIN_POST_BUFFER_HOURS = float(os.environ.get("POST_BUFFER_MIN_HOURS", "3") or "3")
 MAX_POST_BUFFER_HOURS = float(os.environ.get("POST_BUFFER_MAX_HOURS", "6") or "6")
+
+
+def get_review_max_age_days() -> float:
+    raw = os.environ.get("DISCOVERY_REVIEW_MAX_AGE_DAYS")
+    if raw is None or str(raw).strip() == "":
+        return float(DEFAULT_REVIEW_MAX_AGE_DAYS)
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return float(DEFAULT_REVIEW_MAX_AGE_DAYS)
 
 # Optional fixed override. Prefer MIN/MAX for anti-automation jitter.
 _fixed_buffer = os.environ.get("POST_BUFFER_HOURS")
@@ -126,12 +139,61 @@ def list_candidates(
             query = query.eq("status", status)
         else:
             query = query.in_("status", list(status))
+    # Newest suggestions first so the Discover deck stays on fresh sets.
     result = (
-        query.order("created_at", desc=False)
+        query.order("created_at", desc=True)
         .limit(max(1, min(int(limit), 200)))
         .execute()
     )
     return list(result.data or [])
+
+
+def expire_stale_awaiting_review(
+    supabase,
+    *,
+    max_age_days: float | None = None,
+    now: datetime | None = None,
+) -> dict[str, int]:
+    """
+    Auto-decline awaiting_review candidates older than DISCOVERY_REVIEW_MAX_AGE_DAYS.
+
+    Keeps the Discover deck focused on fresh suggestions you still might look at.
+    """
+    days = get_review_max_age_days() if max_age_days is None else max(0.0, float(max_age_days))
+    if days <= 0:
+        return {"checked": 0, "expired": 0}
+
+    anchor = now or datetime.now(timezone.utc)
+    if anchor.tzinfo is None:
+        anchor = anchor.replace(tzinfo=timezone.utc)
+    else:
+        anchor = anchor.astimezone(timezone.utc)
+    cutoff = anchor - timedelta(days=days)
+
+    result = (
+        supabase.table("discovery_candidates")
+        .select("id, created_at, status")
+        .eq("status", "awaiting_review")
+        .lt("created_at", cutoff.isoformat())
+        .execute()
+    )
+    rows = list(result.data or [])
+    expired = 0
+    for row in rows:
+        try:
+            update_candidate(
+                supabase,
+                row["id"],
+                status="rejected_clip",
+                decline_reason="expired",
+            )
+            expired += 1
+        except Exception as exc:
+            print(f"  [WARN] failed to expire candidate {row.get('id')}: {exc}")
+
+    if expired:
+        print(f"  [discovery] expired {expired} stale awaiting_review candidate(s) (>{days}d)")
+    return {"checked": len(rows), "expired": expired}
 
 
 def get_candidate(supabase, candidate_id: str) -> dict[str, Any] | None:

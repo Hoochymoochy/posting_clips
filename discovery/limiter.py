@@ -119,8 +119,9 @@ def create_run(supabase, youtube_url: str) -> dict[str, Any]:
 
 def claim_next_pending_run(supabase) -> dict[str, Any] | None:
     """
-    Atomically claim the oldest pending discovery_runs row (→ processing).
+    Atomically claim the newest pending discovery_runs row (→ processing).
 
+    Newest-first keeps GPU time on fresh Braindance uploads instead of an old backlog.
     Respects the daily active cap. Returns the claimed row, or None if none
     available / daily cap reached.
     """
@@ -132,7 +133,7 @@ def claim_next_pending_run(supabase) -> dict[str, Any] | None:
         supabase.table("discovery_runs")
         .select("*")
         .eq("status", "pending")
-        .order("created_at", desc=False)
+        .order("created_at", desc=True)
         .limit(1)
         .execute()
     )

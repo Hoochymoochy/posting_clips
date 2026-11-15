@@ -13,11 +13,31 @@ def _run_main_py(args: list[str]) -> None:
     root = generate_clips_dir()
     cmd = [sys.executable, str(root / "main.py"), *args]
     print("  [render]", " ".join(cmd))
-    proc = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True)
+    proc = subprocess.run(
+        cmd,
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
     if proc.stdout:
         print(proc.stdout[-4000:])
     if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "render failed")[-2000:]
+        combined = (proc.stderr or "") + "\n" + (proc.stdout or "")
+        lines = [ln.strip() for ln in combined.splitlines() if ln.strip()]
+        # Prefer the actual RuntimeError / ERROR line over a long traceback
+        useful = [
+            ln
+            for ln in lines
+            if ln.startswith("RuntimeError:")
+            or ln.startswith("ERROR:")
+            or "ERROR:" in ln
+            or ln.startswith("Download failed")
+        ]
+        err = useful[-1] if useful else (combined.strip()[-1200] or "render failed")
+        if err.startswith("RuntimeError:"):
+            err = err[len("RuntimeError:") :].strip()
         raise RuntimeError(err)
 
 
@@ -78,11 +98,15 @@ def render_full(
     youtube_url: str,
     start: str,
     end: str,
-    title: str,
+    title: str | None = None,
     out_path: Path,
     segment_path: Path | None = None,
 ) -> Path:
-    """Full-quality vertical short for posting after approve."""
+    """Full-quality vertical short for posting after approve.
+
+    Pass ``title=None`` / empty for a clean render with no burned-in text
+    (Manual Clip Studio). Discovery approve should pass a real hook overlay.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     source = str(segment_path) if segment_path and segment_path.is_file() else youtube_url
     render_args = [
@@ -93,7 +117,7 @@ def render_full(
         "--mode", "fullscreen",
         "--max-res", "1080",
     ]
-    _append_title(render_args, title or "DJ Clip")
+    _append_title(render_args, title)
     _run_main_py(render_args)
     if not out_path.is_file():
         raise RuntimeError(f"Full render produced no file: {out_path}")
