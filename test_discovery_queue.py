@@ -12,6 +12,11 @@ from io import BytesIO
 
 import pytest
 
+from discovery.content_filters import (
+    filter_hard_blocked_sets,
+    hard_block_reason,
+    is_hard_blocked,
+)
 from discovery.queue import (
     enqueue_urls,
     extract_urls,
@@ -242,6 +247,31 @@ def test_filter_recent_sets_drops_old_uploads():
     assert dropped == 2
 
 
+def test_hard_block_bollywood_in_title_and_genres():
+    assert hard_block_reason({"title": "Bollywood Non Stop Dance Party 2026"}) == "bollywood"
+    assert hard_block_reason({"title": "Techno Live", "genres": ["bollywood", "house"]}) == "bollywood"
+    assert hard_block_reason(text="Diwali Bollywood House Party Mix") == "bollywood"
+    assert not is_hard_blocked({"title": "Example DJ Set — Live", "genres": ["house"]})
+    # Avoid substring false positives like "bollywoodish" without word boundary
+    assert not is_hard_blocked({"title": "bollywoodish remix night"})
+
+
+def test_filter_hard_blocked_sets_drops_bollywood():
+    sets = [
+        SAMPLE_SET,
+        {
+            **SAMPLE_SET,
+            "title": "Bollywood Dance Songs | DJ Party",
+            "url": "https://www.youtube.com/watch?v=bolly",
+            "genres": ["house"],
+        },
+    ]
+    kept, dropped, reasons = filter_hard_blocked_sets(sets)
+    assert [s["url"] for s in kept] == [SAMPLE_SET["url"]]
+    assert dropped == 1
+    assert reasons == ["bollywood"]
+
+
 def test_update_queue_end_to_end():
     sb = FakeSupabase()
     sets = [
@@ -256,19 +286,32 @@ def test_update_queue_end_to_end():
             "url": "https://www.youtube.com/watch?v=ancient",
             "published_at": "2024-01-15T18:00:00Z",
         },
+        {
+            **SAMPLE_SET,
+            "title": "Bollywood Non Stop Dance Party 2026",
+            "url": "https://www.youtube.com/watch?v=bollywood",
+            "published_at": _recent_published_at(1),
+            "genres": [],
+        },
     ]
 
     with patch("discovery.queue.fetch_dj_sets", return_value=sets):
         stats = update_queue(sb, feed_url="https://example.com/dj-set")
 
-    assert stats["feed_total"] == 3
-    assert stats["recent"] == 2
+    assert stats["feed_total"] == 4
+    assert stats["recent"] == 3
+    assert stats["eligible"] == 2
     assert stats["dropped_old"] == 1
+    assert stats["dropped_blocked"] == 1
     assert stats["fetched"] == 2
     assert stats["inserted"] == 2
     assert stats["skipped"] == 0
     assert stats["feed_url"] == "https://example.com/dj-set"
     assert len(sb.rows) == 2
+    assert {r["youtube_url"] for r in sb.rows} == {
+        SAMPLE_SET["url"],
+        "https://www.youtube.com/watch?v=second",
+    }
 
     with patch("discovery.queue.fetch_dj_sets", return_value=sets):
         stats2 = update_queue(sb, feed_url="https://example.com/dj-set")

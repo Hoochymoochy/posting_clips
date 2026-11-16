@@ -117,6 +117,18 @@ def process_run(run: dict[str, Any]) -> dict[str, Any]:
 
     entries = list(clustered.get("entries") or [])
     video_title = (clustered.get("video_title") or "").strip()
+
+    from discovery.content_filters import hard_block_reason
+
+    blocked = hard_block_reason(text=video_title)
+    if blocked:
+        mark_run_failed(get_supabase(), run_id)
+        return {
+            "ok": False,
+            "error": f"hard-blocked content: {blocked}",
+            "candidates": [],
+        }
+
     if not entries:
         mark_run_failed(get_supabase(), run_id)
         return {

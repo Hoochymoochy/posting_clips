@@ -14,6 +14,7 @@ __pycache__/
 posted/
 venv/
 clips/
+projects/
 .retry_state.json
 .alert_dedupe.json
 scratch/

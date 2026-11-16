@@ -24,6 +24,7 @@ Features:
       - POST /api/update-queue
       - POST /api/studio/comments|caption  (Manual Clip Studio)
       - POST /api/clips/{id}/render       (render YouTube window → clips/{id}/clip.mp4)
+      - CRUD /api/projects                (editor project folders on disk)
 """
 
 from __future__ import annotations
@@ -1011,6 +1012,157 @@ def studio_generate_caption(payload: dict[str, Any] | None = Body(default=None))
         "hook_archetype": result.get("hook_archetype") or result.get("archetype"),
         "source_comment": comment_text,
     }
+
+
+# ---------------------------------------------------------------------------
+# Editor projects (disk folders under projects/{id}/)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/projects", tags=["Projects"])
+def api_list_projects():
+    from projects_store import list_projects
+
+    return {"success": True, "projects": list_projects()}
+
+
+@app.post("/api/projects", tags=["Projects"])
+def api_create_project(payload: dict[str, Any] | None = Body(default=None)):
+    from projects_store import create_project
+
+    body = payload or {}
+    try:
+        project = create_project(
+            name=str(body.get("name") or "").strip() or None,
+            description=str(body.get("description") or ""),
+            source_clip_id=(str(body.get("source_clip_id") or body.get("clip_id") or "").strip() or None),
+            copy_clip=bool(body.get("copy_clip", True)),
+            timeline=body.get("timeline") if isinstance(body.get("timeline"), dict) else None,
+            asset_name=str(body.get("asset_name") or "").strip() or None,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return {"success": True, "project": project}
+
+
+@app.get("/api/projects/{project_id}", tags=["Projects"])
+def api_get_project(project_id: str):
+    from projects_store import load_project
+
+    try:
+        project = load_project(project_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"success": True, "project": project}
+
+
+@app.patch("/api/projects/{project_id}", tags=["Projects"])
+def api_patch_project(project_id: str, payload: dict[str, Any] | None = Body(default=None)):
+    from projects_store import update_project
+
+    body = payload or {}
+    try:
+        project = update_project(project_id, body)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"success": True, "project": project}
+
+
+@app.delete("/api/projects/{project_id}", tags=["Projects"])
+def api_delete_project(project_id: str):
+    from projects_store import delete_project
+
+    try:
+        delete_project(project_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"success": True}
+
+
+@app.post("/api/projects/{project_id}/assets", tags=["Projects"])
+async def api_upload_project_asset(
+    project_id: str,
+    file: UploadFile = File(...),
+    name: Optional[str] = Form(default=None),
+    duration: float = Form(default=0),
+    width: int = Form(default=0),
+    height: int = Form(default=0),
+):
+    from projects_store import add_asset_bytes
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty file")
+    try:
+        asset = add_asset_bytes(
+            project_id,
+            raw=raw,
+            filename=file.filename or "upload.bin",
+            content_type=file.content_type,
+            name=name,
+            duration=duration,
+            width=width,
+            height=height,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"success": True, "asset": asset}
+
+
+@app.delete("/api/projects/{project_id}/assets/{asset_id}", tags=["Projects"])
+def api_delete_project_asset(project_id: str, asset_id: str):
+    from projects_store import delete_asset
+
+    try:
+        project = delete_asset(project_id, asset_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"success": True, "project": project}
+
+
+@app.get("/api/projects/{project_id}/assets/{asset_id}", tags=["Projects"])
+def api_stream_project_asset(project_id: str, asset_id: str):
+    from projects_store import resolve_asset_path
+
+    try:
+        path = resolve_asset_path(project_id, asset_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    suffix = path.suffix.lower()
+    media_types = {
+        ".mp4": "video/mp4",
+        ".webm": "video/webm",
+        ".mov": "video/quicktime",
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+        ".m4a": "audio/mp4",
+        ".aac": "audio/aac",
+        ".ogg": "audio/ogg",
+        ".flac": "audio/flac",
+    }
+    return FileResponse(
+        path,
+        media_type=media_types.get(suffix, "application/octet-stream"),
+        filename=path.name,
+        content_disposition_type="inline",
+    )
 
 
 @app.get("/api/connections", tags=["Connections"])
