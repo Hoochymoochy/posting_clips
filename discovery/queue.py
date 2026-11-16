@@ -242,20 +242,15 @@ def cancel_stale_pending_runs(
 
 def update_queue(supabase, feed_url: str | None = None) -> dict[str, Any]:
     """Fetch DJ-set feed, keep recent uploads only, enqueue new URLs, cancel stale pending."""
-    from discovery.content_filters import filter_hard_blocked_sets
-
     sets = fetch_dj_sets(feed_url)
     recent, dropped = filter_recent_sets(sets)
-    eligible, dropped_blocked, _ = filter_hard_blocked_sets(recent)
-    urls = extract_urls(eligible)
+    urls = extract_urls(recent)
     stats = enqueue_urls(supabase, urls)
     cancel_stats = cancel_stale_pending_runs(supabase, recent_urls=set(urls))
     stats["feed_url"] = feed_url or get_dj_set_feed_url()
     stats["feed_total"] = len(sets)
     stats["recent"] = len(recent)
-    stats["eligible"] = len(eligible)
     stats["dropped_old"] = dropped
-    stats["dropped_blocked"] = dropped_blocked
     stats["max_age_days"] = get_set_max_age_days()
     stats["cancelled_pending"] = cancel_stats["cancelled"]
     return stats
@@ -361,9 +356,7 @@ def main() -> None:
     print(
         f"feed_total={stats.get('feed_total', stats['fetched'])}  "
         f"recent={stats.get('recent', stats['fetched'])}  "
-        f"eligible={stats.get('eligible', stats.get('recent', stats['fetched']))}  "
         f"dropped_old={stats.get('dropped_old', 0)}  "
-        f"dropped_blocked={stats.get('dropped_blocked', 0)}  "
         f"max_age_days={stats.get('max_age_days', get_set_max_age_days())}"
     )
     print(
