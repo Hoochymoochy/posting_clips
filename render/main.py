@@ -547,11 +547,79 @@ def download_clip(url: str, start: str, end: str, workdir: str, max_res: str = "
 
 def extract_audio(input_path: str, output_path: str, audio_format: str = "mp3", title: str = ""):
     """Extract audio from the downloaded clip into a standalone audio file (mp3, wav, m4a, flac)."""
+    fmt = audio_format.lower()
+
+    # Probe if input file actually has an audio stream.
+    # Silent / video-only MP4s (like button animation overlays) cause ffmpeg -vn to fail with exit code 1.
+    has_audio = False
+    try:
+        probe_cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
+            input_path,
+        ]
+        probe_res = subprocess.run(probe_cmd, capture_output=True, text=True, check=False)
+        has_audio = bool(probe_res.stdout.strip())
+    except Exception:
+        has_audio = True
+
+    if not has_audio:
+        # Generate silence matching input duration so downstream audio decoding never crashes.
+        dur = 1.0
+        try:
+            dur_cmd = [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+                input_path,
+            ]
+            dur_res = subprocess.run(dur_cmd, capture_output=True, text=True, check=False)
+            dur = max(0.1, float(dur_res.stdout.strip()))
+        except Exception:
+            dur = 1.0
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-t",
+            str(dur),
+        ]
+        if title:
+            cmd.extend(["-metadata", f"title={title}"])
+        if fmt == "mp3":
+            cmd.extend(["-c:a", "libmp3lame", "-q:a", "0", output_path])
+        elif fmt == "wav":
+            cmd.extend(["-c:a", "pcm_s16le", output_path])
+        elif fmt in ("m4a", "aac"):
+            cmd.extend(["-c:a", "aac", "-b:a", "320k", output_path])
+        elif fmt == "flac":
+            cmd.extend(["-c:a", "flac", output_path])
+        else:
+            cmd.extend(["-c:a", "libmp3lame", "-q:a", "0", output_path])
+
+        print(f"Generating silent {fmt.upper()} audio ({dur:.2f}s) for audio-less video:", " ".join(cmd))
+        subprocess.run(cmd, check=True)
+        return
+
     cmd = ["ffmpeg", "-y", "-i", input_path, "-vn"]
     if title:
         cmd.extend(["-metadata", f"title={title}"])
 
-    fmt = audio_format.lower()
     if fmt == "mp3":
         cmd.extend(["-c:a", "libmp3lame", "-q:a", "0", output_path])
     elif fmt == "wav":

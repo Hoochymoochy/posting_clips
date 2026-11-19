@@ -450,30 +450,128 @@ def get_clip_info(id: str):
     }
 
 
-def _clip_mp4_path(clip_id: str) -> Path | None:
-    """Return path to clips/{id}/clip.mp4 when it exists on disk."""
-    video = get_clips_dir() / clip_id.strip() / "clip.mp4"
-    return video if video.is_file() else None
+def _clip_variants_meta(clip_id: str) -> list[dict]:
+    from discovery.candidates import _read_clip_variant_list
+
+    return _read_clip_variant_list(clip_id)
+
+
+def _clip_mp4_path(clip_id: str, *, variant: str | None = None) -> Path | None:
+    """Return path to a rendered MP4 for a clip id.
+
+    Variants:
+      - None / '' / 'default' → clip.mp4
+      - 'header' → clip_header.mp4 (falls back to clip.mp4)
+      - 'intro' → clip_intro.mp4
+      - 'tpl_<id>' / template id → clip_tpl_<id>.mp4
+    """
+    import re
+
+    folder = get_clips_dir() / clip_id.strip()
+    clean = (variant or "").strip().lower()
+    if clean in ("", "default", "clip"):
+        names = ["clip.mp4"]
+    elif clean == "header":
+        names = ["clip_header.mp4", "clip.mp4"]
+    elif clean == "intro":
+        names = ["clip_intro.mp4"]
+    elif re.fullmatch(r"tpl_[a-z0-9_-]+", clean):
+        names = [f"clip_{clean}.mp4"]
+    elif re.fullmatch(r"[a-z0-9_-]+", clean):
+        names = [f"clip_tpl_{clean}.mp4", f"clip_{clean}.mp4"]
+    else:
+        return None
+    for name in names:
+        video = folder / name
+        if video.is_file():
+            return video
+    return None
+
+
+def _clip_variant_availability(clip_id: str) -> dict[str, bool]:
+    folder = get_clips_dir() / clip_id.strip()
+    avail = {
+        "default": (folder / "clip.mp4").is_file(),
+        "header": (folder / "clip_header.mp4").is_file() or (folder / "clip.mp4").is_file(),
+        "intro": (folder / "clip_intro.mp4").is_file(),
+    }
+    for row in _clip_variants_meta(clip_id):
+        avail[str(row["key"])] = True
+    return avail
+
+
+def _ensure_clip_mp3(clip_id: str) -> Path:
+    """Extract clips/{id}/clip.mp3 from clip.mp4 (cached; rebuild if mp4 is newer)."""
+    clean_id = clip_id.strip()
+    mp4 = _clip_mp4_path(clean_id)
+    if not mp4:
+        raise HTTPException(status_code=404, detail=f"Rendered video not found for clip {clean_id}")
+
+    mp3 = mp4.with_name("clip.mp3")
+    if mp3.is_file() and mp3.stat().st_mtime >= mp4.stat().st_mtime:
+        return mp3
+
+    from render.main import extract_audio
+
+    try:
+        extract_audio(str(mp4), str(mp3), audio_format="mp3", title=clean_id)
+    except Exception as e:
+        if mp3.is_file():
+            try:
+                mp3.unlink()
+            except OSError:
+                pass
+        raise HTTPException(status_code=500, detail=f"MP3 extraction failed: {e}") from e
+
+    if not mp3.is_file():
+        raise HTTPException(status_code=500, detail="MP3 extraction produced no file.")
+    return mp3
 
 
 @app.get("/api/clips/{id}/download", tags=["Clips"])
 @app.get("/clips/{id}/download", tags=["Clips"])
-def download_clip_video(id: str, inline: bool = False):
+def download_clip_video(id: str, inline: bool = False, variant: str | None = None):
     """
     Stream the rendered MP4 for download (or inline playback when inline=true).
+
+    ``variant``: header (default) | intro | default
     """
     clean_id = id.strip()
-    path = _clip_mp4_path(clean_id)
+    clean_variant = (variant or "header").strip().lower() or "header"
+    path = _clip_mp4_path(clean_id, variant=clean_variant)
     if not path:
-        raise HTTPException(status_code=404, detail=f"Rendered video not found for clip {clean_id}")
+        avail = _clip_variant_availability(clean_id)
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Rendered video not found for clip {clean_id} "
+                f"(variant={clean_variant}, available={avail})"
+            ),
+        )
 
     disposition = "inline" if inline else "attachment"
-    filename = f"{clean_id}.mp4"
+    suffix = "" if clean_variant in ("header", "default", "clip", "") else f"_{clean_variant}"
+    filename = f"{clean_id}{suffix}.mp4"
     return FileResponse(
         path,
         media_type="video/mp4",
         filename=filename,
         content_disposition_type=disposition,
+        headers={"Cache-Control": "private, max-age=60"},
+    )
+
+
+@app.get("/api/clips/{id}/download/audio", tags=["Clips"])
+@app.get("/clips/{id}/download/audio", tags=["Clips"])
+def download_clip_audio(id: str):
+    """Extract audio from the rendered MP4 and stream it as MP3."""
+    clean_id = id.strip()
+    path = _ensure_clip_mp3(clean_id)
+    return FileResponse(
+        path,
+        media_type="audio/mpeg",
+        filename=f"{clean_id}.mp3",
+        content_disposition_type="attachment",
         headers={"Cache-Control": "private, max-age=60"},
     )
 
@@ -727,7 +825,7 @@ def _api_public_base() -> str:
 
 @app.get("/api/review/candidates", tags=["Review"])
 def review_list_candidates():
-    """List discovery candidates awaiting mobile review."""
+    """List discovery candidates awaiting review, plus recent dual-render ready clips."""
     from db import get_supabase, is_configured
     from discovery.candidates import list_candidates, public_candidate
 
@@ -735,20 +833,68 @@ def review_list_candidates():
         raise HTTPException(status_code=503, detail="Supabase is not configured.")
 
     try:
-        rows = list_candidates(get_supabase(), status="awaiting_review", limit=50)
+        sb = get_supabase()
+        rows = list_candidates(sb, status="awaiting_review", limit=50)
         # Hide ones waiting on caption regen so the deck doesn't show stale captions mid-job
         visible = [
             r for r in rows
             if (r.get("decline_reason") or "") != "caption_bad_pending"
         ]
+        ready_rows = list_candidates(
+            sb,
+            status=["queued", "rendering", "approved", "failed"],
+            limit=40,
+        )
+        # Drop ancient failures from the Clips status board (keep last 2 days).
+        from datetime import datetime, timedelta, timezone
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=2)
+
+        def _fresh_enough(row: dict) -> bool:
+            status = (row.get("status") or "").strip().lower()
+            if status != "failed":
+                return True
+            raw = row.get("updated_at") or row.get("created_at")
+            if not raw:
+                return False
+            try:
+                dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc) >= cutoff
+            except ValueError:
+                return False
+
+        ready_rows = [r for r in ready_rows if _fresh_enough(r)]
         base = _api_public_base()
+        candidates = [public_candidate(r, api_base=base) for r in visible]
+        ready = [public_candidate(r, api_base=base) for r in ready_rows]
         return {
             "success": True,
-            "candidates": [public_candidate(r, api_base=base) for r in visible],
-            "count": len(visible),
+            "candidates": candidates,
+            "count": len(candidates),
+            "ready": ready,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/review/{candidate_id}", tags=["Review"])
+def review_get_candidate(candidate_id: str):
+    """Fetch one candidate (for post-approve status polling)."""
+    from db import get_supabase, is_configured
+    from discovery.candidates import get_candidate, public_candidate
+
+    if not is_configured():
+        raise HTTPException(status_code=503, detail="Supabase is not configured.")
+
+    row = get_candidate(get_supabase(), candidate_id.strip())
+    if not row:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    return {
+        "success": True,
+        "candidate": public_candidate(row, api_base=_api_public_base()),
+    }
 
 
 @app.get("/api/review/{candidate_id}/preview", tags=["Review"])
@@ -847,27 +993,41 @@ async def upload_review_preview(
 
 @app.post("/api/review/{candidate_id}/approve", tags=["Review"])
 def review_approve(candidate_id: str):
-    """Approve a preview — discovery worker will full-render and schedule."""
+    """Approve a preview and start full render on this host immediately."""
+    import threading
+
     from db import get_supabase, is_configured
     from discovery.candidates import public_candidate
-    from discovery.review import approve_candidate
+    from discovery.review import approve_candidate, full_render_and_queue
 
     if not is_configured():
         raise HTTPException(status_code=503, detail="Supabase is not configured.")
 
     try:
         updated = approve_candidate(get_supabase(), candidate_id)
-        return {
-            "success": True,
-            "candidate": public_candidate(updated, api_base=_api_public_base()),
-            "message": "Approved — full render queued on the discovery worker.",
-        }
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    cid = candidate_id.strip()
+
+    def _render() -> None:
+        try:
+            full_render_and_queue(get_supabase(), cid)
+            print(f"  [approve] full render done for {cid}")
+        except Exception as exc:
+            print(f"  [WARN] approve render failed for {cid}: {exc}")
+
+    threading.Thread(target=_render, name=f"approve-render-{cid[:8]}", daemon=True).start()
+
+    return {
+        "success": True,
+        "candidate": public_candidate(updated, api_base=_api_public_base()),
+        "message": "Approved — rendering on this host now. Watch Clips for status.",
+    }
 
 
 @app.post("/api/review/{candidate_id}/decline", tags=["Review"])
@@ -1162,6 +1322,217 @@ def api_stream_project_asset(project_id: str, asset_id: str):
         media_type=media_types.get(suffix, "application/octet-stream"),
         filename=path.name,
         content_disposition_type="inline",
+    )
+
+
+@app.get("/api/templates", tags=["Templates"])
+def get_templates_status():
+    """List Discover templates (multi-template library)."""
+    from templates.loader import list_templates, load_template_config, templates_dir
+
+    try:
+        cfg = load_template_config()
+        templates = list_templates()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    ready = [t for t in templates if t.get("ready")]
+    active = [t for t in templates if t.get("active") and t.get("ready")]
+    # Back-compat fields for older UI
+    first = templates[0] if templates else None
+    return {
+        "success": True,
+        "templates": templates,
+        "count": len(templates),
+        "intro": len(ready) > 0,
+        "intro_exists": len(ready) > 0,
+        "intro_bytes": (ready[0].get("intro_bytes") if ready else 0),
+        "editor_project_id": (first or {}).get("project_id"),
+        "active_ids": [t["id"] for t in active],
+        "templates_dir": str(templates_dir()),
+        "config": cfg,
+    }
+
+
+@app.post("/api/templates", tags=["Templates"])
+def create_template_entry(payload: dict[str, Any] | None = Body(default=None)):
+    """Create an empty template shell (then edit in the template editor)."""
+    from templates.loader import create_template
+
+    body = payload or {}
+    try:
+        row = create_template(
+            name=str(body.get("name") or "").strip() or None,
+            project_id=str(body.get("project_id") or "").strip() or None,
+        )
+        return {"success": True, "template": row}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/templates/{template_id}", tags=["Templates"])
+def get_template_entry(template_id: str):
+    from templates.loader import get_template
+
+    row = get_template(template_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return {"success": True, "template": row}
+
+
+@app.patch("/api/templates/{template_id}", tags=["Templates"])
+def patch_template_entry(template_id: str, payload: dict[str, Any] | None = Body(default=None)):
+    from templates.loader import get_template, update_template
+
+    if not get_template(template_id):
+        raise HTTPException(status_code=404, detail="Template not found")
+    body = payload or {}
+    try:
+        row = update_template(
+            template_id,
+            name=body["name"] if "name" in body else None,
+            project_id=body["project_id"] if "project_id" in body else None,
+            active=body["active"] if "active" in body else None,
+        )
+        return {"success": True, "template": row}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.delete("/api/templates/{template_id}", tags=["Templates"])
+def delete_template_entry(template_id: str):
+    from templates.loader import delete_template, get_template
+
+    if not get_template(template_id):
+        raise HTTPException(status_code=404, detail="Template not found")
+    delete_template(template_id)
+    return {"success": True}
+
+
+@app.post("/api/templates/{template_id}/intro", tags=["Templates"])
+async def upload_named_template_intro(
+    template_id: str,
+    video: UploadFile = File(...),
+    project_id: Optional[str] = Form(default=None),
+    name: Optional[str] = Form(default=None),
+):
+    """Save an Editor export as this template's intro bumper."""
+    import tempfile
+
+    from templates.loader import ensure_template, get_template, save_template_intro
+
+    ensure_template(
+        template_id,
+        name=(name or "").strip() or None,
+        project_id=(project_id or "").strip() or None,
+    )
+
+    tmp_path: Path | None = None
+    bytes_written = 0
+    try:
+        with tempfile.NamedTemporaryFile(prefix="tpl_intro_", suffix=".mp4", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+            while chunk := await video.read(CHUNK_SIZE):
+                tmp.write(chunk)
+                bytes_written += len(chunk)
+        if bytes_written < 1000:
+            raise HTTPException(status_code=400, detail="Uploaded intro video is empty or too small.")
+        row = save_template_intro(
+            template_id,
+            source_path=tmp_path,
+            project_id=(project_id or "").strip() or None,
+            name=(name or "").strip() or None,
+        )
+        row = get_template(template_id) or row
+        return {
+            "success": True,
+            "template": row,
+            "bytes": bytes_written,
+            "editor_project_id": (row or {}).get("project_id"),
+            "message": "Template saved.",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save template: {e}") from e
+    finally:
+        if tmp_path and tmp_path.is_file():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+@app.post("/api/templates/intro", tags=["Templates"])
+async def upload_intro_template(
+    video: UploadFile = File(...),
+    project_id: Optional[str] = Form(default=None),
+    template_id: Optional[str] = Form(default=None),
+    name: Optional[str] = Form(default=None),
+):
+    """
+    Back-compat upload. Prefer POST /api/templates/{id}/intro.
+    Writes into the given template_id, or creates/uses the first/default entry.
+    """
+    from templates.loader import create_template, list_templates
+
+    tid = (template_id or "").strip()
+    if not tid:
+        existing = list_templates()
+        tid = existing[0]["id"] if existing else create_template(name=name or "Default intro")["id"]
+
+    return await upload_named_template_intro(
+        tid,
+        video=video,
+        project_id=project_id,
+        name=name,
+    )
+
+
+@app.post("/api/media/to-mp3", tags=["Media"])
+async def convert_media_to_mp3(
+    file: UploadFile = File(...),
+    title: Optional[str] = Form(default=None),
+):
+    """
+    Extract / convert uploaded media (mp4, wav, webm, …) to an MP3 download.
+    Used by the Editor for timeline and per-clip audio export.
+    """
+    import tempfile
+
+    from render.main import extract_audio
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    src_name = (file.filename or "input.bin").strip() or "input.bin"
+    suffix = Path(src_name).suffix.lower() or ".bin"
+    meta_title = (title or Path(src_name).stem or "clip").strip() or "clip"
+
+    with tempfile.TemporaryDirectory(prefix="to_mp3_") as tmp:
+        tmp_dir = Path(tmp)
+        src = tmp_dir / f"input{suffix}"
+        dst = tmp_dir / "output.mp3"
+        src.write_bytes(raw)
+        try:
+            extract_audio(str(src), str(dst), audio_format="mp3", title=meta_title)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"MP3 conversion failed: {e}") from e
+        if not dst.is_file():
+            raise HTTPException(status_code=500, detail="MP3 conversion produced no file.")
+        data = dst.read_bytes()
+
+    safe_stem = "".join(c if c.isalnum() or c in "-_" else "_" for c in meta_title)[:60].strip("_") or "clip"
+    from fastapi.responses import Response
+
+    return Response(
+        content=data,
+        media_type="audio/mpeg",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_stem}.mp3"',
+            "Cache-Control": "no-store",
+        },
     )
 
 

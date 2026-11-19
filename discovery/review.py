@@ -48,8 +48,8 @@ def regenerate_caption(candidate: dict[str, Any]) -> tuple[str, str]:
 
 def approve_candidate(supabase, candidate_id: str) -> dict[str, Any]:
     """
-    Mark approved. The discovery pipeline worker full-renders and registers the clip.
-    Fast path for HTTP — heavy work is async in the discovery worker thread.
+    Claim for local render immediately (status=rendering) so a remote discovery
+    worker cannot race the same approval and fail on a foreign filesystem path.
     """
     from discovery.candidates import get_candidate, update_candidate
 
@@ -62,8 +62,9 @@ def approve_candidate(supabase, candidate_id: str) -> dict[str, Any]:
     return update_candidate(
         supabase,
         candidate_id,
-        status="approved",
+        status="rendering",
         decline_reason=None,
+        error_message=None,
     )
 
 
@@ -81,9 +82,6 @@ def decline_candidate(supabase, candidate_id: str, reason: str) -> dict[str, Any
         raise ValueError(f"Candidate is not awaiting review (status={candidate.get('status')})")
 
     clean = (reason or "").strip().lower()
-    if clean not in ("clip_bad", "caption_bad"):
-        raise ValueError("reason must be clip_bad or caption_bad")
-
     if clean == "clip_bad":
         return update_candidate(
             supabase,
@@ -91,7 +89,10 @@ def decline_candidate(supabase, candidate_id: str, reason: str) -> dict[str, Any
             status="rejected_clip",
             decline_reason="clip_bad",
         )
+    if clean != "caption_bad":
+        raise ValueError("reason must be 'clip_bad' or 'caption_bad'")
 
+    # caption_bad — regenerate caption, stay in review
     new_caption, hook_archetype = regenerate_caption(candidate)
     return update_candidate(
         supabase,
@@ -105,26 +106,47 @@ def decline_candidate(supabase, candidate_id: str, reason: str) -> dict[str, Any
 
 def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
     """
-    Full GPU/CPU render + register_clip into local clips/{id}/clip.mp4.
+    Full GPU/CPU template render + register_clip into local clips/{id}/.
+
+    Writes one MP4 per active Discover template (named after the template),
+    plus clip.mp4 as a copy of the first template output.
+
     Called by the discovery worker for status=approved.
     """
+    import json
+
     from discovery.candidates import (
         get_candidate,
         update_candidate,
     )
     from discovery.paths import workspace_dir
-    from discovery.render import render_full
+    from discovery.render import (
+        ensure_segment,
+        render_variant_header,
+        render_variant_intro,
+    )
     from db import register_clip
+    from templates.loader import (
+        active_templates,
+        load_template_config,
+        template_intro_path,
+    )
     from worker import get_clips_dir
 
     candidate = get_candidate(supabase, candidate_id)
     if not candidate:
         raise LookupError(f"Candidate {candidate_id} not found")
     status = (candidate.get("status") or "").strip().lower()
-    if status not in ("awaiting_review", "approved", "rendering"):
+    if status not in ("awaiting_review", "approved", "rendering", "failed"):
         raise ValueError(f"Candidate cannot be rendered (status={candidate.get('status')})")
 
-    update_candidate(supabase, candidate_id, status="rendering", decline_reason=None)
+    update_candidate(
+        supabase,
+        candidate_id,
+        status="rendering",
+        decline_reason=None,
+        error_message=None,
+    )
 
     youtube_url = (candidate.get("youtube_url") or "").strip()
     start = candidate.get("start_time") or "00:00:00"
@@ -138,25 +160,98 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
     # Burn the short hook into the short — never the full YouTube venue title.
     overlay_title = short_hook_overlay(caption)
 
-    stem = f"{_safe_stem(overlay_title)}_{_safe_stem(str(start))}_{str(uuid.uuid4())[:8]}"
-    out_path = workspace_dir() / "renders" / f"{stem}_fullscreen.mp4"
+    clip_id = str(uuid.uuid4())
+    dest_folder = get_clips_dir() / clip_id
+    dest_folder.mkdir(parents=True, exist_ok=True)
+    dest_video = dest_folder / "clip.mp4"
+
+    # Shared raw segment so we only hit YouTube once for all variants.
     segment = candidate.get("segment_path")
     segment_path = Path(segment) if segment and Path(segment).is_file() else None
+    if segment_path is None:
+        stem = f"{_safe_stem(overlay_title)}_{_safe_stem(str(start))}_{str(uuid.uuid4())[:8]}"
+        segment_path = workspace_dir() / "segments" / f"{stem}.mp4"
 
     try:
-        render_full(
+        tpl_cfg = load_template_config()
+        ensure_segment(
             youtube_url=youtube_url,
             start=start,
             end=end,
-            title=overlay_title,
-            out_path=out_path,
             segment_path=segment_path,
         )
-        clip_id = str(uuid.uuid4())
-        dest_folder = get_clips_dir() / clip_id
-        dest_folder.mkdir(parents=True, exist_ok=True)
-        dest_video = dest_folder / "clip.mp4"
-        shutil.copy2(out_path, dest_video)
+
+        templates = active_templates()
+        variant_meta: list[dict[str, Any]] = []
+        variant_paths: dict[str, str] = {}
+
+        if templates:
+            for row in templates:
+                tid = str(row.get("id") or "").strip()
+                if not tid:
+                    continue
+                bumper = template_intro_path(tid)
+                if not bumper.is_file():
+                    continue
+                key = f"tpl_{tid}"
+                out = dest_folder / f"clip_{key}.mp4"
+                label = str(row.get("name") or tid)
+                print(f"  [templates] rendering “{label}” → {out}")
+                render_variant_intro(
+                    youtube_url=youtube_url,
+                    start=start,
+                    end=end,
+                    title=overlay_title,
+                    out_path=out,
+                    segment_path=segment_path,
+                    config=tpl_cfg,
+                    bumper_path=bumper,
+                )
+                variant_meta.append(
+                    {
+                        "key": key,
+                        "name": label,
+                        "template_id": tid,
+                        "file": out.name,
+                    }
+                )
+                variant_paths[key] = str(out)
+
+            # Back-compat aliases for older Clips UI / download links.
+            first = dest_folder / variant_meta[0]["file"] if variant_meta else None
+            if first and first.is_file():
+                shutil.copy2(first, dest_folder / "clip_intro.mp4")
+                shutil.copy2(first, dest_video)
+                variant_paths["intro"] = str(dest_folder / "clip_intro.mp4")
+                variant_paths["default"] = str(dest_video)
+        else:
+            # No active bumper templates — fall back to hook-only body.
+            header_video = dest_folder / "clip_header.mp4"
+            print(f"  [templates] no active templates — hook-only → {header_video}")
+            render_variant_header(
+                youtube_url=youtube_url,
+                start=start,
+                end=end,
+                title=overlay_title,
+                out_path=header_video,
+                segment_path=segment_path,
+                config=tpl_cfg,
+            )
+            shutil.copy2(header_video, dest_video)
+            variant_meta.append(
+                {
+                    "key": "header",
+                    "name": "Hook",
+                    "template_id": None,
+                    "file": header_video.name,
+                }
+            )
+            variant_paths["header"] = str(header_video)
+            variant_paths["default"] = str(dest_video)
+
+        with open(dest_folder / "variants.json", "w", encoding="utf-8") as f:
+            json.dump({"variants": variant_meta}, f, indent=2)
+            f.write("\n")
 
         # Prefer start/end delta; fall back to probing the rendered file.
         duration_seconds = None
@@ -169,7 +264,7 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
                 duration_seconds = round(float(e) - float(s), 2)
         except Exception:
             pass
-        if duration_seconds is None:
+        if duration_seconds is None and dest_video.is_file():
             try:
                 from uploader import get_video_info
 
@@ -181,7 +276,7 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
 
         storage_url = f"clips/{clip_id}/clip.mp4"
         # Download-only: register the rendered file with no social channel rows
-        # and no publish schedule (manual download from Studio / My Clips).
+        # and no publish schedule (manual download from Studio / Discover).
         db_result = register_clip(
             clip_id=clip_id,
             youtube_url=youtube_url,
@@ -201,12 +296,16 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
             status="queued",
             clip_id=clip_id,
             scheduled_at=None,
+            segment_path=str(segment_path),
+            error_message=None,
         )
         return {
             "candidate": updated,
             "clip_id": clip_id,
             "scheduled_at": None,
             "video_path": str(dest_video),
+            "variants": variant_paths,
+            "variant_meta": variant_meta,
             "supabase": db_result,
         }
     except Exception as exc:

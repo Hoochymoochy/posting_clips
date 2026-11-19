@@ -13,10 +13,18 @@ def generate_clips_dir() -> Path:
     Directory that contains main.py (yt-dlp + FFmpeg vertical render).
 
     Override with GENERATE_CLIPS_DIR if the packages are not siblings.
+    Ignores env paths that don't exist (e.g. leftover Linux cloud paths on Windows).
     """
     env = os.environ.get("GENERATE_CLIPS_DIR", "").strip()
     if env:
-        return Path(env).expanduser().resolve()
+        p = Path(env).expanduser()
+        try:
+            resolved = p.resolve()
+        except OSError:
+            resolved = p
+        if (resolved / "main.py").is_file():
+            return resolved
+        print(f"  [WARN] GENERATE_CLIPS_DIR ignored (no main.py): {env}")
     sibling = _POSTING_ROOT.parent / "generate_clips"
     if (sibling / "main.py").is_file():
         return sibling.resolve()

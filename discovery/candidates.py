@@ -260,14 +260,103 @@ def update_candidate(supabase, candidate_id: str, **fields: Any) -> dict[str, An
     return result.data[0]
 
 
+def _read_clip_variant_list(clip_id: str) -> list[dict[str, Any]]:
+    """Named download variants for a rendered clip folder."""
+    import json
+
+    folder = get_clips_dir() / str(clip_id)
+    meta_path = folder / "variants.json"
+    if meta_path.is_file():
+        try:
+            with open(meta_path, encoding="utf-8") as f:
+                data = json.load(f)
+            rows = data.get("variants") if isinstance(data, dict) else None
+            if isinstance(rows, list):
+                out: list[dict[str, Any]] = []
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    key = str(row.get("key") or "").strip()
+                    filename = str(row.get("file") or "").strip()
+                    if not key:
+                        continue
+                    path = folder / filename if filename else folder / f"clip_{key}.mp4"
+                    if path.is_file():
+                        out.append(
+                            {
+                                "key": key,
+                                "name": str(row.get("name") or key),
+                                "template_id": row.get("template_id"),
+                                "file": path.name,
+                            }
+                        )
+                if out:
+                    return out
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+
+    out = []
+    for path in sorted(folder.glob("clip_tpl_*.mp4")):
+        key = path.stem.replace("clip_", "", 1)
+        tid = key[4:] if key.startswith("tpl_") else key
+        out.append({"key": key, "name": tid, "template_id": tid, "file": path.name})
+    if (folder / "clip_intro.mp4").is_file() and not any(r["key"] == "intro" for r in out):
+        label = "Intro"
+        try:
+            from templates.loader import active_templates
+
+            active = active_templates()
+            if active:
+                label = str(active[0].get("name") or label)
+        except Exception:
+            pass
+        out.append({"key": "intro", "name": label, "template_id": None, "file": "clip_intro.mp4"})
+    if (folder / "clip_header.mp4").is_file() and not any(r["key"] == "header" for r in out):
+        out.append({"key": "header", "name": "Hook", "template_id": None, "file": "clip_header.mp4"})
+    if not out and (folder / "clip.mp4").is_file():
+        out.append({"key": "default", "name": "Clip", "template_id": None, "file": "clip.mp4"})
+    return out
+
+
 def public_candidate(row: dict[str, Any], *, api_base: str = "") -> dict[str, Any]:
-    """Shape a candidate for the Vercel frontend (absolute preview URL)."""
+    """Shape a candidate for the Vercel frontend (absolute preview URL + variant downloads)."""
     out = dict(row)
     cid = out.get("id")
+    clip_id = out.get("clip_id")
     base = (api_base or "").rstrip("/")
     if cid:
         path = f"/api/review/{cid}/preview?v=notitle"
         out["preview_url"] = f"{base}{path}" if base else path
+
+    variants = {"header": False, "intro": False, "default": False}
+    download_urls: dict[str, str] = {}
+    variant_list: list[dict[str, Any]] = []
+    if clip_id:
+        folder = get_clips_dir() / str(clip_id)
+        variants = {
+            "default": (folder / "clip.mp4").is_file(),
+            "header": (folder / "clip_header.mp4").is_file() or (folder / "clip.mp4").is_file(),
+            "intro": (folder / "clip_intro.mp4").is_file(),
+        }
+        for item in _read_clip_variant_list(str(clip_id)):
+            key = str(item.get("key") or "")
+            if not key:
+                continue
+            variants[key] = True
+            path = f"/api/clips/{clip_id}/download?variant={key}"
+            url = f"{base}{path}" if base else path
+            download_urls[key] = url
+            variant_list.append(
+                {
+                    "key": key,
+                    "name": item.get("name") or key,
+                    "template_id": item.get("template_id"),
+                    "url": url,
+                }
+            )
+    out["variants"] = variants
+    out["download_urls"] = download_urls
+    out["variant_list"] = variant_list
     return out
 
 
