@@ -186,6 +186,8 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
         variant_paths: dict[str, str] = {}
 
         if templates:
+            from templates.layout import process_layout_for_template
+
             for row in templates:
                 tid = str(row.get("id") or "").strip()
                 if not tid:
@@ -196,7 +198,18 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
                 key = f"tpl_{tid}"
                 out = dest_folder / f"clip_{key}.mp4"
                 label = str(row.get("name") or tid)
-                print(f"  [templates] rendering “{label}” → {out}")
+                layout = process_layout_for_template(row)
+                if layout:
+                    style_bits = layout.get("style") or {}
+                    audio_bits = layout.get("timeline_audio") or layout.get("body_audio") or {}
+                    print(
+                        f"  [templates] rendering “{label}” → {out} "
+                        f"(project={layout.get('project_id')}, "
+                        f"hook={style_bits.get('font')}/{style_bits.get('text_style')}, "
+                        f"timeline_audio={bool(audio_bits)})"
+                    )
+                else:
+                    print(f"  [templates] rendering “{label}” → {out}")
                 render_variant_intro(
                     youtube_url=youtube_url,
                     start=start,
@@ -206,6 +219,7 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
                     segment_path=segment_path,
                     config=tpl_cfg,
                     bumper_path=bumper,
+                    layout=layout,
                 )
                 variant_meta.append(
                     {

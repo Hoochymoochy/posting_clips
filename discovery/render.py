@@ -256,26 +256,54 @@ def render_variant_intro(
     segment_path: Path | None = None,
     config: dict[str, Any] | None = None,
     bumper_path: Path | str | None = None,
+    layout: dict[str, Any] | None = None,
 ) -> Path:
-    """Intro template: optional light hook on body → prepend bumper → loudnorm."""
-    from templates.compose import apply_loudnorm, concat_bumper_and_body
+    """Intro template: moment→body MP4/MP3, concat bumper, apply moment audio by Editor timing."""
+    from templates.compose import (
+        apply_loudnorm,
+        apply_timeline_audio,
+        concat_bumper_and_body,
+        extract_audio_track,
+        probe_duration_seconds,
+        trim_video_start,
+    )
     from templates.loader import load_template_config, resolve_bumper_path
 
     cfg = config if config is not None else load_template_config()
     intro = cfg.get("intro") or {}
     if not isinstance(intro, dict):
         intro = {}
+    layout = layout if isinstance(layout, dict) else {}
+
+    # Prefer bound-project typography; fall back to shared config.json intro section.
     style = _style_from_section(intro)
+    project_style = layout.get("style") if isinstance(layout.get("style"), dict) else {}
+    style.update({k: v for k, v in project_style.items() if v is not None and v != ""})
+
     bumper = Path(bumper_path) if bumper_path else resolve_bumper_path(cfg)
-    body_title = bool(intro.get("body_title", False))
+    if "body_title" in layout:
+        body_title = bool(layout.get("body_title"))
+    else:
+        body_title = bool(intro.get("body_title", False))
     burn_title = (title or "").strip() if body_title else ""
+
+    # Editor timing only — media always comes from the downloaded moment.
+    timeline_audio = layout.get("timeline_audio") if isinstance(layout.get("timeline_audio"), dict) else None
+    if timeline_audio is None and isinstance(layout.get("body_audio"), dict):
+        timeline_audio = layout.get("body_audio")
+    use_moment_audio = bool(layout.get("dynamic_from_moment", True)) and timeline_audio is not None
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="variant_intro_") as tmp:
         body = Path(tmp) / "intro_body.mp4"
+        body_for_concat = Path(tmp) / "intro_body_sync.mp4"
         stitched = Path(tmp) / "intro_stitched.mp4"
+        with_bed = Path(tmp) / "intro_with_bed.mp4"
+        moment_audio = Path(tmp) / "moment_audio.m4a"
+
+        # Dynamic MP4 = downloaded Discover moment (segment or URL window).
         render_full(
             youtube_url=youtube_url,
             start=start,
@@ -285,13 +313,71 @@ def render_variant_intro(
             segment_path=segment_path,
             **style,
         )
-        concat_bumper_and_body(bumper, body, stitched)
+
+        bumper_dur = probe_duration_seconds(bumper)
+        try:
+            editor_delay = float((timeline_audio or {}).get("delay_sec") or 0.0)
+        except (TypeError, ValueError):
+            editor_delay = 0.0
+        try:
+            editor_ss = float((timeline_audio or {}).get("ss") or 0.0)
+        except (TypeError, ValueError):
+            editor_ss = 0.0
+        try:
+            editor_dur = (
+                float(timeline_audio["duration"])
+                if timeline_audio and timeline_audio.get("duration") is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            editor_dur = None
+
+        # Preroll (Editor Dynamic MP3 under bumper): play moment audio from t=0 and
+        # trim body so A/V meet when the bumper ends. Otherwise sync audio to body.
+        preroll = use_moment_audio and editor_delay <= 0.05
+        if preroll and bumper_dur > 0.05:
+            trim_video_start(body, body_for_concat, start_sec=bumper_dur)
+            audio_delay = 0.0
+            audio_ss = editor_ss
+            print(
+                f"  [templates] moment audio preroll under bumper "
+                f"(trim body {bumper_dur:.2f}s for A/V sync)"
+            )
+        else:
+            body_for_concat = body
+            audio_delay = bumper_dur if use_moment_audio else editor_delay
+            audio_ss = editor_ss
+
+        # 1) Bumper + moment video.
+        concat_bumper_and_body(bumper, body_for_concat, stitched)
+
+        # 2) Dynamic MP3 = audio extracted from the same downloaded moment.
+        final_video = stitched
+        if use_moment_audio:
+            audio_src = Path(segment_path) if segment_path and Path(segment_path).is_file() else body
+            print(f"  [templates] Dynamic MP3 ← downloaded moment ({audio_src.name})")
+            extract_audio_track(audio_src, moment_audio)
+            print(
+                f"  [templates] timeline audio ← moment "
+                f"(ss={audio_ss:.2f}s, delay={audio_delay:.2f}s, "
+                f"dur={editor_dur if editor_dur is not None else 'auto'})"
+            )
+            apply_timeline_audio(
+                stitched,
+                moment_audio,
+                with_bed,
+                audio_ss=audio_ss,
+                delay_sec=audio_delay,
+                audio_duration=editor_dur,
+            )
+            final_video = with_bed
+
         if intro.get("loudnorm", True):
-            apply_loudnorm(stitched, out_path)
+            apply_loudnorm(final_video, out_path)
         else:
             import shutil
 
-            shutil.copy2(stitched, out_path)
+            shutil.copy2(final_video, out_path)
 
     if not out_path.is_file():
         raise RuntimeError(f"Intro variant produced no file: {out_path}")

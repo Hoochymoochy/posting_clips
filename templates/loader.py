@@ -134,6 +134,7 @@ def _public_template(meta: dict[str, Any]) -> dict[str, Any]:
 def migrate_legacy_template() -> dict[str, Any] | None:
     """
     One-time: fold legacy assets/intro.mp4 + editor_binding into library/default.
+    Skips if the library already has other templates (e.g. default was deleted).
     """
     legacy_intro = _legacy_bumper_path()
     binding = load_editor_binding()
@@ -145,11 +146,21 @@ def migrate_legacy_template() -> dict[str, Any] | None:
         # Already migrated — do not call get_template (it re-enters migrate).
         meta = _read_meta(dest_meta) or {
             "id": _LEGACY_DEFAULT_ID,
-            "name": "Default intro",
+            "name": "Intro template",
             "active": True,
             "project_id": legacy_project,
         }
         return _public_template(meta)
+
+    # Do not resurrect "default" once the user deleted it or already has a library.
+    try:
+        has_other = any(
+            p.is_dir() and p.name != _LEGACY_DEFAULT_ID for p in library_dir().iterdir()
+        )
+    except OSError:
+        has_other = False
+    if has_other:
+        return None
 
     has_legacy = (legacy_intro.is_file() and legacy_intro.stat().st_size > 20_000) or legacy_project
     if not has_legacy:
@@ -163,7 +174,7 @@ def migrate_legacy_template() -> dict[str, Any] | None:
         _LEGACY_DEFAULT_ID,
         {
             "id": _LEGACY_DEFAULT_ID,
-            "name": "Default intro",
+            "name": "Intro template",
             "project_id": legacy_project,
             "active": True,
         },

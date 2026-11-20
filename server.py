@@ -1479,7 +1479,7 @@ async def upload_intro_template(
     tid = (template_id or "").strip()
     if not tid:
         existing = list_templates()
-        tid = existing[0]["id"] if existing else create_template(name=name or "Default intro")["id"]
+        tid = existing[0]["id"] if existing else create_template(name=name or "Intro template")["id"]
 
     return await upload_named_template_intro(
         tid,

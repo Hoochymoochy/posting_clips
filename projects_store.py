@@ -207,9 +207,12 @@ def update_project(project_id: str, patch: dict[str, Any]) -> dict[str, Any]:
             if not existing:
                 continue
             updated = {**existing}
-            for key in ("name", "kind", "duration", "width", "height"):
+            for key in ("name", "kind", "duration", "width", "height", "templateSlot"):
                 if key in row and row[key] is not None:
                     updated[key] = row[key]
+            # Allow clearing templateSlot when client omits / nulls it after remap.
+            if "templateSlot" in row and row["templateSlot"] is None:
+                updated.pop("templateSlot", None)
             merged.append(updated)
         # Preserve assets not mentioned in patch
         kept_ids = {a["id"] for a in merged}
