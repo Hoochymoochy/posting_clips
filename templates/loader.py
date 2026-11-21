@@ -26,15 +26,50 @@ def library_dir() -> Path:
     return _LIBRARY_DIR
 
 
+_DEFAULT_TEMPLATE_CONFIG: dict[str, Any] = {
+    "intro": {
+        "bumper_path": "assets/intro.mp4",
+        "loudnorm": True,
+        "body_title": False,
+        "text_style": "minimal",
+        "font": "bahnschrift",
+        "font_size": 48,
+        "title_y": "h*0.25",
+        "color": "none",
+    },
+    "header": {
+        "loudnorm": True,
+        "text_style": "neon",
+        "font": "impact",
+        "font_size": 56,
+        "title_y": "h*0.22",
+        "color": "none",
+    },
+}
+
+
 def load_template_config() -> dict[str, Any]:
     path = _TEMPLATES_ROOT / "config.json"
     if not path.is_file():
-        raise FileNotFoundError(f"Template config not found: {path}")
+        return dict(_DEFAULT_TEMPLATE_CONFIG)
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, dict):
         raise ValueError("templates/config.json must be a JSON object")
     return data
+
+
+SELECT_TEMPLATE_MESSAGE = (
+    "Select a template first — turn one on in Templates (and save an intro)."
+)
+
+
+def require_active_templates() -> list[dict[str, Any]]:
+    """Return active+ready templates, or raise ValueError with a clear UI message."""
+    templates = active_templates()
+    if not templates:
+        raise ValueError(SELECT_TEMPLATE_MESSAGE)
+    return templates
 
 
 def _legacy_bumper_path(config: dict[str, Any] | None = None) -> Path:

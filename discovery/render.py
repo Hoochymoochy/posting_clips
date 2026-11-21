@@ -37,7 +37,7 @@ def _run_main_py(args: list[str]) -> None:
             or "ERROR:" in ln
             or ln.startswith("Download failed")
         ]
-        err = useful[-1] if useful else (combined.strip()[-1200] or "render failed")
+        err = useful[-1] if useful else (combined.strip()[-1200:] or "render failed")
         if err.startswith("RuntimeError:"):
             err = err[len("RuntimeError:") :].strip()
         raise RuntimeError(err)

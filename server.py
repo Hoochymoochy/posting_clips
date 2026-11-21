@@ -999,9 +999,16 @@ def review_approve(candidate_id: str):
     from db import get_supabase, is_configured
     from discovery.candidates import public_candidate
     from discovery.review import approve_candidate, full_render_and_queue
+    from templates.loader import SELECT_TEMPLATE_MESSAGE, require_active_templates
 
     if not is_configured():
         raise HTTPException(status_code=503, detail="Supabase is not configured.")
+
+    # Don't pull the moment out of Discover if there's nothing to render with.
+    try:
+        require_active_templates()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e) or SELECT_TEMPLATE_MESSAGE)
 
     try:
         updated = approve_candidate(get_supabase(), candidate_id)

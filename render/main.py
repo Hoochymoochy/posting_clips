@@ -242,9 +242,14 @@ def check_deps():
     """Verify that required external tools exist."""
     ensure_environment()
     missing = []
-    for tool in ("yt-dlp", "ffmpeg"):
-        if shutil.which(tool) is None:
-            missing.append(tool)
+    if shutil.which("ffmpeg") is None:
+        missing.append("ffmpeg")
+    # Prefer the same interpreter module path used by _ytdlp_bin(); PATH binary is optional.
+    try:
+        import yt_dlp  # noqa: F401
+    except ImportError:
+        if shutil.which("yt-dlp") is None:
+            missing.append("yt-dlp")
 
     if missing:
         msg = [f"Error: Missing required tool(s): {', '.join(missing)}."]

@@ -122,13 +122,12 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
     from discovery.paths import workspace_dir
     from discovery.render import (
         ensure_segment,
-        render_variant_header,
         render_variant_intro,
     )
     from db import register_clip
     from templates.loader import (
-        active_templates,
         load_template_config,
+        require_active_templates,
         template_intro_path,
     )
     from worker import get_clips_dir
@@ -173,6 +172,8 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
         segment_path = workspace_dir() / "segments" / f"{stem}.mp4"
 
     try:
+        # Fail fast with a clear UI message instead of a cryptic render error.
+        templates = require_active_templates()
         tpl_cfg = load_template_config()
         ensure_segment(
             youtube_url=youtube_url,
@@ -181,86 +182,65 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
             segment_path=segment_path,
         )
 
-        templates = active_templates()
         variant_meta: list[dict[str, Any]] = []
         variant_paths: dict[str, str] = {}
 
-        if templates:
-            from templates.layout import process_layout_for_template
+        from templates.layout import process_layout_for_template
 
-            for row in templates:
-                tid = str(row.get("id") or "").strip()
-                if not tid:
-                    continue
-                bumper = template_intro_path(tid)
-                if not bumper.is_file():
-                    continue
-                key = f"tpl_{tid}"
-                out = dest_folder / f"clip_{key}.mp4"
-                label = str(row.get("name") or tid)
-                layout = process_layout_for_template(row)
-                if layout:
-                    style_bits = layout.get("style") or {}
-                    audio_bits = layout.get("timeline_audio") or layout.get("body_audio") or {}
-                    print(
-                        f"  [templates] rendering “{label}” → {out} "
-                        f"(project={layout.get('project_id')}, "
-                        f"hook={style_bits.get('font')}/{style_bits.get('text_style')}, "
-                        f"timeline_audio={bool(audio_bits)})"
-                    )
-                else:
-                    print(f"  [templates] rendering “{label}” → {out}")
-                render_variant_intro(
-                    youtube_url=youtube_url,
-                    start=start,
-                    end=end,
-                    title=overlay_title,
-                    out_path=out,
-                    segment_path=segment_path,
-                    config=tpl_cfg,
-                    bumper_path=bumper,
-                    layout=layout,
+        for row in templates:
+            tid = str(row.get("id") or "").strip()
+            if not tid:
+                continue
+            bumper = template_intro_path(tid)
+            if not bumper.is_file():
+                continue
+            key = f"tpl_{tid}"
+            out = dest_folder / f"clip_{key}.mp4"
+            label = str(row.get("name") or tid)
+            layout = process_layout_for_template(row)
+            if layout:
+                style_bits = layout.get("style") or {}
+                audio_bits = layout.get("timeline_audio") or layout.get("body_audio") or {}
+                print(
+                    f"  [templates] rendering “{label}” → {out} "
+                    f"(project={layout.get('project_id')}, "
+                    f"hook={style_bits.get('font')}/{style_bits.get('text_style')}, "
+                    f"timeline_audio={bool(audio_bits)})"
                 )
-                variant_meta.append(
-                    {
-                        "key": key,
-                        "name": label,
-                        "template_id": tid,
-                        "file": out.name,
-                    }
-                )
-                variant_paths[key] = str(out)
-
-            # Back-compat aliases for older Clips UI / download links.
-            first = dest_folder / variant_meta[0]["file"] if variant_meta else None
-            if first and first.is_file():
-                shutil.copy2(first, dest_folder / "clip_intro.mp4")
-                shutil.copy2(first, dest_video)
-                variant_paths["intro"] = str(dest_folder / "clip_intro.mp4")
-                variant_paths["default"] = str(dest_video)
-        else:
-            # No active bumper templates — fall back to hook-only body.
-            header_video = dest_folder / "clip_header.mp4"
-            print(f"  [templates] no active templates — hook-only → {header_video}")
-            render_variant_header(
+            else:
+                print(f"  [templates] rendering “{label}” → {out}")
+            render_variant_intro(
                 youtube_url=youtube_url,
                 start=start,
                 end=end,
                 title=overlay_title,
-                out_path=header_video,
+                out_path=out,
                 segment_path=segment_path,
                 config=tpl_cfg,
+                bumper_path=bumper,
+                layout=layout,
             )
-            shutil.copy2(header_video, dest_video)
             variant_meta.append(
                 {
-                    "key": "header",
-                    "name": "Hook",
-                    "template_id": None,
-                    "file": header_video.name,
+                    "key": key,
+                    "name": label,
+                    "template_id": tid,
+                    "file": out.name,
                 }
             )
-            variant_paths["header"] = str(header_video)
+            variant_paths[key] = str(out)
+
+        if not variant_meta:
+            from templates.loader import SELECT_TEMPLATE_MESSAGE
+
+            raise ValueError(SELECT_TEMPLATE_MESSAGE)
+
+        # Back-compat aliases for older Clips UI / download links.
+        first = dest_folder / variant_meta[0]["file"]
+        if first.is_file():
+            shutil.copy2(first, dest_folder / "clip_intro.mp4")
+            shutil.copy2(first, dest_video)
+            variant_paths["intro"] = str(dest_folder / "clip_intro.mp4")
             variant_paths["default"] = str(dest_video)
 
         with open(dest_folder / "variants.json", "w", encoding="utf-8") as f:
@@ -323,10 +303,14 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
             "supabase": db_result,
         }
     except Exception as exc:
+        # Keep the moment on Discover so the user can fix templates / retry.
         update_candidate(
             supabase,
             candidate_id,
-            status="failed",
+            status="awaiting_review",
+            clip_id=None,
+            scheduled_at=None,
+            decline_reason=None,
             error_message=str(exc)[:2000],
         )
         raise
