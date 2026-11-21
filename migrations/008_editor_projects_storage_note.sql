@@ -1,0 +1,12 @@
+-- Editor projects + Discover templates are synced via Supabase Storage
+-- (bucket: editor-projects), not Postgres tables.
+--
+-- Layout:
+--   projects/{id}/project.json
+--   projects/{id}/assets/{filename}
+--   templates/{id}/meta.json
+--   templates/{id}/intro.mp4
+--
+-- The FastAPI poster host keeps a local disk cache under projects/ and
+-- templates/library/, and hydrates from Storage when a file is missing.
+-- Created automatically by cloud_store.ensure_bucket() on first write.

@@ -147,6 +147,12 @@ def _write_meta(template_id: str, meta: dict[str, Any]) -> dict[str, Any]:
     with open(folder / "meta.json", "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
         f.write("\n")
+    try:
+        from cloud_store import upsert_template_meta
+
+        upsert_template_meta(payload)
+    except Exception as exc:
+        print(f"  [templates] cloud meta upsert failed: {exc}")
     return payload
 
 
@@ -219,6 +225,17 @@ def migrate_legacy_template() -> dict[str, Any] | None:
 
 def list_templates() -> list[dict[str, Any]]:
     migrate_legacy_template()
+    # Pull any templates that only exist in Supabase onto this host.
+    try:
+        from cloud_store import hydrate_template_to_disk, list_cloud_template_ids
+
+        local_ids = {p.name for p in library_dir().iterdir() if p.is_dir()}
+        for tid in list_cloud_template_ids():
+            if tid not in local_ids:
+                hydrate_template_to_disk(tid, template_dir(tid))
+    except Exception as exc:
+        print(f"  [templates] cloud list hydrate failed: {exc}")
+
     rows: list[dict[str, Any]] = []
     root = library_dir()
     for child in sorted(root.iterdir(), key=lambda p: p.name):
@@ -248,6 +265,14 @@ def get_template(template_id: str) -> dict[str, Any] | None:
     migrate_legacy_template()
     tid = _safe_id(template_id)
     meta = _read_meta(template_meta_path(tid))
+    if not meta:
+        try:
+            from cloud_store import hydrate_template_to_disk
+
+            meta = hydrate_template_to_disk(tid, template_dir(tid))
+        except Exception as exc:
+            print(f"  [templates] cloud hydrate failed: {exc}")
+            meta = None
     if not meta:
         return None
     return _public_template(meta)
@@ -323,6 +348,12 @@ def delete_template(template_id: str) -> bool:
     if not folder.exists():
         return False
     shutil.rmtree(folder, ignore_errors=True)
+    try:
+        from cloud_store import delete_cloud_template
+
+        delete_cloud_template(tid)
+    except Exception as exc:
+        print(f"  [templates] cloud delete failed: {exc}")
     return True
 
 
@@ -350,6 +381,13 @@ def save_template_intro(
     if project_id is not None:
         meta["project_id"] = project_id.strip() or None
     saved = _write_meta(tid, meta)
+
+    try:
+        from cloud_store import upload_template_intro
+
+        upload_template_intro(tid, dest)
+    except Exception as exc:
+        print(f"  [templates] cloud intro upload failed: {exc}")
 
     # Keep legacy bumper in sync with the first/active template for old render paths.
     _sync_legacy_default(tid, dest, meta.get("project_id"))

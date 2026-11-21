@@ -89,11 +89,36 @@ def _write_project(data: dict[str, Any]) -> dict[str, Any]:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
+    try:
+        from cloud_store import upload_project_asset, upsert_project
+
+        upsert_project(data)
+        # Keep asset binaries in sync (new uploads + clip copies on create).
+        for row in data.get("assets") or []:
+            if not isinstance(row, dict):
+                continue
+            filename = str(row.get("filename") or "").strip()
+            if not filename:
+                continue
+            asset_path = assets_dir(project_id) / filename
+            if asset_path.is_file():
+                upload_project_asset(project_id, filename, asset_path.read_bytes())
+    except Exception as exc:
+        print(f"  [projects] cloud upsert failed: {exc}")
     return data
 
 
 def load_project(project_id: str) -> dict[str, Any]:
-    path = project_json_path(project_id)
+    pid = _safe_id(project_id, "project id")
+    path = project_json_path(pid)
+    if not path.is_file():
+        # Pull from Supabase Storage when this host never saw the project (e.g. remote poster).
+        try:
+            from cloud_store import hydrate_project_to_disk
+
+            hydrate_project_to_disk(pid, project_folder(pid))
+        except Exception as exc:
+            print(f"  [projects] cloud hydrate failed: {exc}")
     if not path.is_file():
         raise FileNotFoundError(f"Project {project_id} not found")
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -109,28 +134,44 @@ def load_project(project_id: str) -> dict[str, Any]:
             "captions": [],
         },
     )
+    # Ensure asset files exist locally (timeline media for the editor).
+    try:
+        from cloud_store import hydrate_project_to_disk
+
+        missing = False
+        for row in data.get("assets") or []:
+            if not isinstance(row, dict):
+                continue
+            filename = str(row.get("filename") or "")
+            if filename and not (assets_dir(pid) / filename).is_file():
+                missing = True
+                break
+        if missing:
+            hydrate_project_to_disk(pid, project_folder(pid))
+            data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"  [projects] asset hydrate failed: {exc}")
     return data
 
 
 def list_projects() -> list[dict[str, Any]]:
     root = get_projects_dir()
-    items: list[dict[str, Any]] = []
-    if not root.is_dir():
-        return items
-    for child in sorted(root.iterdir(), key=lambda p: p.name, reverse=True):
-        if not child.is_dir():
-            continue
-        meta_path = child / "project.json"
-        if not meta_path.is_file():
-            continue
-        try:
-            data = json.loads(meta_path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        assets = data.get("assets") or []
-        items.append(
-            {
-                "id": data.get("id") or child.name,
+    by_id: dict[str, dict[str, Any]] = {}
+    if root.is_dir():
+        for child in sorted(root.iterdir(), key=lambda p: p.name, reverse=True):
+            if not child.is_dir():
+                continue
+            meta_path = child / "project.json"
+            if not meta_path.is_file():
+                continue
+            try:
+                data = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            assets = data.get("assets") or []
+            pid = str(data.get("id") or child.name)
+            by_id[pid] = {
+                "id": pid,
                 "name": data.get("name") or "Untitled project",
                 "description": data.get("description") or "",
                 "source_clip_id": data.get("source_clip_id"),
@@ -138,7 +179,31 @@ def list_projects() -> list[dict[str, Any]]:
                 "updated_at": data.get("updated_at"),
                 "asset_count": len(assets) if isinstance(assets, list) else 0,
             }
-        )
+
+    # Include projects that only exist in Supabase yet.
+    try:
+        from cloud_store import fetch_project, list_cloud_project_ids
+
+        for pid in list_cloud_project_ids():
+            if pid in by_id:
+                continue
+            data = fetch_project(pid)
+            if not data:
+                continue
+            assets = data.get("assets") or []
+            by_id[pid] = {
+                "id": pid,
+                "name": data.get("name") or "Untitled project",
+                "description": data.get("description") or "",
+                "source_clip_id": data.get("source_clip_id"),
+                "created_at": data.get("created_at"),
+                "updated_at": data.get("updated_at"),
+                "asset_count": len(assets) if isinstance(assets, list) else 0,
+            }
+    except Exception as exc:
+        print(f"  [projects] cloud list failed: {exc}")
+
+    items = list(by_id.values())
     items.sort(key=lambda x: str(x.get("updated_at") or ""), reverse=True)
     return items
 
@@ -226,8 +291,21 @@ def update_project(project_id: str, patch: dict[str, Any]) -> dict[str, Any]:
 def delete_project(project_id: str) -> None:
     folder = project_folder(project_id)
     if not folder.is_dir():
+        # Still try cloud cleanup if disk copy is already gone.
+        try:
+            from cloud_store import delete_cloud_project
+
+            delete_cloud_project(project_id)
+        except Exception:
+            pass
         raise FileNotFoundError(f"Project {project_id} not found")
     shutil.rmtree(folder)
+    try:
+        from cloud_store import delete_cloud_project
+
+        delete_cloud_project(project_id)
+    except Exception as exc:
+        print(f"  [projects] cloud delete failed: {exc}")
 
 
 def _guess_kind(filename: str, content_type: str | None = None) -> str:
@@ -280,6 +358,12 @@ def add_asset_bytes(
     }
     data.setdefault("assets", []).append(asset)
     _write_project(data)
+    try:
+        from cloud_store import upload_project_asset
+
+        upload_project_asset(project_id, disk_name, raw, content_type)
+    except Exception as exc:
+        print(f"  [projects] cloud asset upload failed: {exc}")
     return asset
 
 
