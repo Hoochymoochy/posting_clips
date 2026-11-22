@@ -90,6 +90,56 @@ def _clean_caption(text: str) -> str:
     return out.strip()
 
 
+def _extra_comment_lines(
+    comment_text: str,
+    extra_comments: list[str] | None,
+) -> list[str]:
+    extras = [str(c).strip() for c in (extra_comments or []) if str(c).strip()]
+    primary_lower = (comment_text or "").strip().lower()
+    return [c for c in extras if c.lower() != primary_lower][:4]
+
+
+def _fill_prompt_placeholders(
+    template: str,
+    *,
+    comment_text: str = "",
+    video_title: str = "",
+    entry_timestamp: str = "",
+    extra_comments: list[str] | None = None,
+) -> str:
+    """
+    Substitute {title}, {comment}, {timestamp}, {comments} in a custom prompt.
+
+    Unknown braces are left alone. Doubled braces {{ }} escape a literal brace.
+    """
+    title = (video_title or "").strip()
+    comment = (comment_text or "").strip()
+    ts = (entry_timestamp or "").strip()
+    extras = _extra_comment_lines(comment, extra_comments)
+    comments_blob = "\n".join(f"- {c}" for c in ([comment] if comment else []) + extras)
+
+    values = {
+        "title": title,
+        "comment": comment,
+        "timestamp": ts,
+        "comments": comments_blob,
+        "set_title": title,
+        "fan_comment": comment,
+        "entry_timestamp": ts,
+    }
+
+    def repl(match: re.Match[str]) -> str:
+        key = match.group(1).strip().lower()
+        if key in values:
+            return values[key]
+        return match.group(0)
+
+    # Protect escaped braces, then replace known placeholders.
+    text = (template or "").replace("{{", "\0OPEN\0").replace("}}", "\0CLOSE\0")
+    text = re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", repl, text)
+    return text.replace("\0OPEN\0", "{").replace("\0CLOSE\0", "}")
+
+
 def _build_user_prompt(
     comment_text: str,
     *,
@@ -97,7 +147,36 @@ def _build_user_prompt(
     entry_timestamp: str = "",
     extra_comments: list[str] | None = None,
     hook_archetype: str | None = None,
+    custom_prompt: str | None = None,
 ) -> str:
+    custom = (custom_prompt or "").strip()
+    if custom:
+        filled = _fill_prompt_placeholders(
+            custom,
+            comment_text=comment_text,
+            video_title=video_title,
+            entry_timestamp=entry_timestamp,
+            extra_comments=extra_comments,
+        )
+        # Always append structured data so the model has facts even if the
+        # custom prompt omitted placeholders.
+        parts = [filled, "", "---", "CLIP DATA:"]
+        title = (video_title or "").strip()
+        if title:
+            parts.append(f"SET TITLE: {title}")
+        ts = (entry_timestamp or "").strip()
+        if ts:
+            parts.append(f"MOMENT TIME: {ts}")
+        parts.append(f"FAN COMMENT: {(comment_text or '').strip()}")
+        extras = _extra_comment_lines(comment_text, extra_comments)
+        if extras:
+            parts.append("NEARBY FAN COMMENTS (same moment):")
+            for i, extra in enumerate(extras, start=1):
+                parts.append(f"  {i}. {extra}")
+        parts.append("")
+        parts.append("Output ONLY the caption — no labels, quotes, or reasoning.")
+        return "\n".join(parts)
+
     parts = []
     title = (video_title or "").strip()
     if title:
@@ -106,10 +185,7 @@ def _build_user_prompt(
     if ts:
         parts.append(f"MOMENT TIME: {ts}")
     parts.append(f"FAN COMMENT: {(comment_text or '').strip()}")
-    extras = [str(c).strip() for c in (extra_comments or []) if str(c).strip()]
-    # Avoid repeating the primary comment
-    primary_lower = (comment_text or "").strip().lower()
-    extras = [c for c in extras if c.lower() != primary_lower][:4]
+    extras = _extra_comment_lines(comment_text, extra_comments)
     if extras:
         parts.append("NEARBY FAN COMMENTS (same moment):")
         for i, extra in enumerate(extras, start=1):
@@ -133,6 +209,7 @@ def rewrite_caption_with_ollama(
     entry_timestamp: str = "",
     extra_comments: list[str] | None = None,
     hook_archetype: str | None = None,
+    custom_prompt: str | None = None,
     model: str | None = None,
     host: str | None = None,
     timeout_sec: float = 60.0,
@@ -143,6 +220,8 @@ def rewrite_caption_with_ollama(
     Falls back to a light template (or raw comment) if Ollama is down.
     ``extra_comments`` are sibling reactions from a time cluster (optional).
     ``hook_archetype`` steers the caption into a defined hook style.
+    ``custom_prompt`` (template AI caption) overrides the default instruction;
+    placeholders {title}, {comment}, {timestamp}, {comments} are filled from data.
     """
     raw = (comment_text or "").strip()
     title = (video_title or "").strip()
@@ -151,15 +230,25 @@ def rewrite_caption_with_ollama(
 
     fallback = _personality_fallback(raw, title)
     archetype = (hook_archetype or "").strip().lower() or None
+    custom = (custom_prompt or "").strip() or None
 
     model_name = (model or DEFAULT_OLLAMA_MODEL).strip() or DEFAULT_OLLAMA_MODEL
     base = _normalize_ollama_host(host or DEFAULT_OLLAMA_HOST)
     url = f"{base}/api/chat"
 
+    if custom:
+        system_content = (
+            "You write short TikTok/Reels captions for DJ-set clips. "
+            "Follow the user's custom instructions closely. "
+            "Output ONLY the caption — no labels, quotes, or reasoning."
+        )
+    else:
+        system_content = _system_prompt_for_archetype(archetype)
+
     body: dict[str, Any] = {
         "model": model_name,
         "messages": [
-            {"role": "system", "content": _system_prompt_for_archetype(archetype)},
+            {"role": "system", "content": system_content},
             {
                 "role": "user",
                 "content": _build_user_prompt(
@@ -167,7 +256,8 @@ def rewrite_caption_with_ollama(
                     video_title=title,
                     entry_timestamp=entry_timestamp,
                     extra_comments=extra_comments,
-                    hook_archetype=archetype,
+                    hook_archetype=None if custom else archetype,
+                    custom_prompt=custom,
                 ),
             },
         ],
@@ -256,6 +346,7 @@ def rewrite_caption_with_ollama(
         "source_comment": raw,
         "video_title": title,
         "hook_archetype": archetype,
+        "custom_prompt": bool(custom),
     }
 
 

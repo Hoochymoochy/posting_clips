@@ -35,12 +35,22 @@ def regenerate_caption(candidate: dict[str, Any]) -> tuple[str, str]:
     primary, extras = _extra_comments_from_candidate(candidate)
     existing = (candidate.get("hook_archetype") or "").strip().lower()
     archetype = existing or select_archetype()
+
+    custom_prompt = None
+    try:
+        from templates.loader import active_caption_prompt
+
+        custom_prompt = active_caption_prompt()
+    except Exception:
+        custom_prompt = None
+
     result = rewrite_caption_with_ollama(
         primary,
         video_title=str(candidate.get("title") or ""),
         entry_timestamp=str(candidate.get("start_time") or ""),
         extra_comments=extras,
-        hook_archetype=archetype,
+        hook_archetype=None if custom_prompt else archetype,
+        custom_prompt=custom_prompt,
     )
     caption = (result.get("caption") or primary or candidate.get("title") or "New DJ clip").strip()
     return caption, archetype
@@ -192,7 +202,9 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
             if not tid:
                 continue
             bumper = template_intro_path(tid)
-            if not bumper.is_file():
+            bumper_ok = bumper.is_file() and bumper.stat().st_size > 20_000
+            # Hook-only templates have no bumper — still render the moment body.
+            if not bumper_ok and not str(row.get("project_id") or "").strip():
                 continue
             key = f"tpl_{tid}"
             out = dest_folder / f"clip_{key}.mp4"
@@ -204,6 +216,7 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
                 print(
                     f"  [templates] rendering “{label}” → {out} "
                     f"(project={layout.get('project_id')}, "
+                    f"bumper={'yes' if bumper_ok else 'none'}, "
                     f"hook={style_bits.get('font')}/{style_bits.get('text_style')}, "
                     f"timeline_audio={bool(audio_bits)})"
                 )
@@ -217,7 +230,7 @@ def full_render_and_queue(supabase, candidate_id: str) -> dict[str, Any]:
                 out_path=out,
                 segment_path=segment_path,
                 config=tpl_cfg,
-                bumper_path=bumper,
+                bumper_path=bumper if bumper_ok else None,
                 layout=layout,
             )
             variant_meta.append(

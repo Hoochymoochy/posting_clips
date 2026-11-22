@@ -1136,6 +1136,9 @@ def studio_generate_caption(payload: dict[str, Any] | None = Body(default=None))
     """
     Manual Clip Studio: rewrite a fan comment (plus optional nearby comments)
     into a social caption via Ollama on this host.
+
+    Optional ``custom_prompt`` / ``caption_prompt`` overrides the default voice
+    (also auto-loaded from the first active template when omitted).
     """
     body = payload or {}
     comment_text = str(body.get("comment_text") or body.get("comment") or "").strip()
@@ -1145,6 +1148,9 @@ def studio_generate_caption(payload: dict[str, Any] | None = Body(default=None))
     if not isinstance(extras_raw, list):
         extras_raw = []
     extra_comments = [str(c).strip() for c in extras_raw if str(c).strip()]
+    custom_prompt = str(
+        body.get("custom_prompt") or body.get("caption_prompt") or ""
+    ).strip() or None
 
     if not comment_text and not video_title:
         raise HTTPException(
@@ -1156,13 +1162,22 @@ def studio_generate_caption(payload: dict[str, Any] | None = Body(default=None))
         from hook_archetypes import select_archetype
         from ollama_caption import rewrite_caption_with_ollama, short_hook_overlay
 
+        if not custom_prompt:
+            try:
+                from templates.loader import active_caption_prompt
+
+                custom_prompt = active_caption_prompt()
+            except Exception:
+                custom_prompt = None
+
         archetype = str(body.get("hook_archetype") or "").strip() or select_archetype()
         result = rewrite_caption_with_ollama(
             comment_text or video_title,
             video_title=video_title,
             entry_timestamp=entry_timestamp,
             extra_comments=extra_comments,
-            hook_archetype=archetype,
+            hook_archetype=None if custom_prompt else archetype,
+            custom_prompt=custom_prompt,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1177,6 +1192,7 @@ def studio_generate_caption(payload: dict[str, Any] | None = Body(default=None))
         "error": result.get("error"),
         "model": result.get("model"),
         "hook_archetype": result.get("hook_archetype") or result.get("archetype"),
+        "custom_prompt": bool(custom_prompt),
         "source_comment": comment_text,
     }
 
@@ -1395,11 +1411,20 @@ def patch_template_entry(template_id: str, payload: dict[str, Any] | None = Body
         raise HTTPException(status_code=404, detail="Template not found")
     body = payload or {}
     try:
+        caption_prompt_arg: str | None = None
+        if "caption_prompt" in body or "custom_prompt" in body:
+            caption_prompt_arg = str(
+                body.get("caption_prompt")
+                if "caption_prompt" in body
+                else body.get("custom_prompt")
+                or ""
+            )
         row = update_template(
             template_id,
             name=body["name"] if "name" in body else None,
             project_id=body["project_id"] if "project_id" in body else None,
             active=body["active"] if "active" in body else None,
+            caption_prompt=caption_prompt_arg,
         )
         return {"success": True, "template": row}
     except Exception as e:

@@ -60,7 +60,7 @@ def load_template_config() -> dict[str, Any]:
 
 
 SELECT_TEMPLATE_MESSAGE = (
-    "Select a template first — turn one on in Templates (and save an intro)."
+    "Select a template first — turn one on in Templates (and Save template in the editor)."
 )
 
 
@@ -159,14 +159,20 @@ def _write_meta(template_id: str, meta: dict[str, Any]) -> dict[str, Any]:
 def _public_template(meta: dict[str, Any]) -> dict[str, Any]:
     tid = str(meta.get("id") or "")
     intro = template_intro_path(tid)
-    ready = intro.is_file() and intro.stat().st_size > 20_000
+    project_id = str(meta.get("project_id") or "").strip() or None
+    has_intro = intro.is_file() and intro.stat().st_size > 20_000
+    # Hook-only templates (no bumper) are ready once a project is bound.
+    ready = has_intro or bool(project_id)
+    caption_prompt = str(meta.get("caption_prompt") or "").strip() or None
     return {
         "id": tid,
         "name": str(meta.get("name") or "Untitled template"),
-        "project_id": (str(meta.get("project_id") or "").strip() or None),
+        "project_id": project_id,
         "active": bool(meta.get("active", True)),
         "ready": ready,
+        "has_bumper": has_intro,
         "intro_bytes": intro.stat().st_size if intro.is_file() else 0,
+        "caption_prompt": caption_prompt,
         "created_at": meta.get("created_at"),
         "updated_at": meta.get("updated_at"),
     }
@@ -323,6 +329,7 @@ def update_template(
     name: str | None = None,
     project_id: str | None = None,
     active: bool | None = None,
+    caption_prompt: str | None = None,
 ) -> dict[str, Any]:
     tid = _safe_id(template_id)
     meta = _read_meta(template_meta_path(tid)) or {
@@ -338,8 +345,20 @@ def update_template(
         meta["project_id"] = project_id.strip() or None
     if active is not None:
         meta["active"] = bool(active)
+    if caption_prompt is not None:
+        # Empty string clears the custom prompt (falls back to default Ollama voice).
+        meta["caption_prompt"] = caption_prompt.strip() or None
     saved = _write_meta(tid, meta)
     return _public_template(saved)
+
+
+def active_caption_prompt() -> str | None:
+    """First active+ready template caption prompt, if any."""
+    for row in active_templates():
+        prompt = str(row.get("caption_prompt") or "").strip()
+        if prompt:
+            return prompt
+    return None
 
 
 def delete_template(template_id: str) -> bool:

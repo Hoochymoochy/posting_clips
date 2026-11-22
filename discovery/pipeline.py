@@ -71,12 +71,22 @@ def _caption_for_entry(entry: dict[str, Any], video_title: str) -> tuple[str, st
     ]
     if primary and primary not in extras:
         extras = [primary, *extras]
+
+    custom_prompt = None
+    try:
+        from templates.loader import active_caption_prompt
+
+        custom_prompt = active_caption_prompt()
+    except Exception:
+        custom_prompt = None
+
     result = rewrite_caption_with_ollama(
         primary or video_title,
         video_title=video_title,
         entry_timestamp=str(entry.get("entry_timestamp") or ""),
         extra_comments=extras[1:] if len(extras) > 1 else extras,
-        hook_archetype=archetype,
+        hook_archetype=None if custom_prompt else archetype,
+        custom_prompt=custom_prompt,
     )
     caption = (result.get("caption") or primary or video_title or "New DJ clip").strip()
     return caption, archetype

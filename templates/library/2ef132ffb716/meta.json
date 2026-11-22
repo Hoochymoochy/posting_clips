@@ -1,0 +1,9 @@
+{
+  "id": "2ef132ffb716",
+  "name": "Hype caption",
+  "project_id": "9a7dbca1726c4ccd80368d2589620fe3",
+  "active": true,
+  "updated_at": "2026-11-22T03:44:16.901024+00:00",
+  "created_at": "2026-11-21T08:00:11.421430+00:00",
+  "caption_prompt": "Write one short on-screen hook for a 10\u201315s DJ drop reaction clip.\n\nStyle:\n- Sound like a hyped fan in the comments, not a brand\n- 3\u20138 words max, lowercase is fine\n- Punchy reaction energy like \"this transition is crazy\" / \"the drop just hit\" / \"nobody was ready\"\n- No hashtags, no emojis, no quotes\n\nUse the set vibe from {title} and the fan energy from {comment}.\nIf nearby reactions help, pull from {comments} \u2014 don't list them.\n\nOutput ONLY the hook line."
+}

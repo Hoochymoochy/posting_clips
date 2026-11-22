@@ -280,7 +280,14 @@ def render_variant_intro(
     project_style = layout.get("style") if isinstance(layout.get("style"), dict) else {}
     style.update({k: v for k, v in project_style.items() if v is not None and v != ""})
 
-    bumper = Path(bumper_path) if bumper_path else resolve_bumper_path(cfg)
+    # Explicit None = hook-only / no bumper. Missing path falls back to legacy shared bumper.
+    if bumper_path is None:
+        bumper: Path | None = None
+    else:
+        bumper = Path(bumper_path) if bumper_path else resolve_bumper_path(cfg)
+        if bumper and not (bumper.is_file() and bumper.stat().st_size > 20_000):
+            bumper = None
+
     if "body_title" in layout:
         body_title = bool(layout.get("body_title"))
     else:
@@ -297,6 +304,8 @@ def render_variant_intro(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="variant_intro_") as tmp:
+        import shutil
+
         body = Path(tmp) / "intro_body.mp4"
         body_for_concat = Path(tmp) / "intro_body_sync.mp4"
         stitched = Path(tmp) / "intro_stitched.mp4"
@@ -314,7 +323,7 @@ def render_variant_intro(
             **style,
         )
 
-        bumper_dur = probe_duration_seconds(bumper)
+        bumper_dur = probe_duration_seconds(bumper) if bumper else 0.0
         try:
             editor_delay = float((timeline_audio or {}).get("delay_sec") or 0.0)
         except (TypeError, ValueError):
@@ -345,11 +354,15 @@ def render_variant_intro(
             )
         else:
             body_for_concat = body
-            audio_delay = bumper_dur if use_moment_audio else editor_delay
+            audio_delay = bumper_dur if (use_moment_audio and bumper_dur > 0.05) else editor_delay
             audio_ss = editor_ss
 
-        # 1) Bumper + moment video.
-        concat_bumper_and_body(bumper, body_for_concat, stitched)
+        # 1) Bumper + moment video (or body only when hook-only / no bumper).
+        if bumper and bumper_dur > 0.05:
+            concat_bumper_and_body(bumper, body_for_concat, stitched)
+        else:
+            print("  [templates] no bumper — rendering hook/body only")
+            shutil.copy2(body_for_concat, stitched)
 
         # 2) Dynamic MP3 = audio extracted from the same downloaded moment.
         final_video = stitched
@@ -375,8 +388,6 @@ def render_variant_intro(
         if intro.get("loudnorm", True):
             apply_loudnorm(final_video, out_path)
         else:
-            import shutil
-
             shutil.copy2(final_video, out_path)
 
     if not out_path.is_file():
