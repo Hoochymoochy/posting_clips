@@ -22,7 +22,17 @@ DEFAULT_MAX_COMMENTS = 400
 DEFAULT_CLUSTER_GAP_SEC = 45
 # YouTube Shorts hard cap.
 MAX_CLIP_DURATION_SEC = 60
-DISCOVERY_PREVIEW_COUNT = 2
+def _preview_count() -> int:
+    raw = os.environ.get("DISCOVERY_PREVIEW_COUNT", "").strip()
+    try:
+        n = int(raw) if raw else 2
+    except ValueError:
+        n = 2
+    return max(1, min(n, 10))
+
+
+# Moments queued per set for Discover review (override with DISCOVERY_PREVIEW_COUNT).
+DISCOVERY_PREVIEW_COUNT = _preview_count()
 
 # Timestamps that look like clip markers inside free-form comment text.
 # Prefer longer matches (H:MM:SS) before MM:SS / M:SS.

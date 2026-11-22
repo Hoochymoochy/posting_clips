@@ -7,11 +7,22 @@ Failed runs do not consume quota and do not block a same-day retry for that URL.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from typing import Any
 
-# Easy to change later.
-MAX_RUNS_PER_DAY = 3
+
+def _max_runs_per_day() -> int:
+    raw = os.environ.get("DISCOVERY_MAX_RUNS_PER_DAY", "").strip()
+    try:
+        n = int(raw) if raw else 3
+    except ValueError:
+        n = 3
+    return max(1, min(n, 30))
+
+
+# Easy to change later (override with DISCOVERY_MAX_RUNS_PER_DAY).
+MAX_RUNS_PER_DAY = _max_runs_per_day()
 
 # create_run / enqueue-style quota (rows that "own" a slot for the day).
 _QUOTA_STATUSES = ("pending", "processing", "success")
