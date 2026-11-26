@@ -39,9 +39,11 @@ from typing import Any, Optional
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+
+from auth_guard import require_youtube_import_user
 
 from worker import (
     get_clips_dir,
@@ -159,6 +161,17 @@ app.add_middleware(
 from analytics.routes import router as analytics_router  # noqa: E402
 
 app.include_router(analytics_router)
+
+
+@app.get("/api/creator-connections", tags=["Publishing"])
+def api_creator_connections(
+    x_braindance_owner_id: Optional[str] = Header(default=None, alias="X-Braindance-Owner-Id"),
+):
+    """Per-creator official publishing connection status (no secrets)."""
+    from creator_credentials import public_connections
+
+    oid = _request_owner_id(None, x_braindance_owner_id)
+    return {"success": True, **public_connections(oid)}
 
 
 CHUNK_SIZE = 1024 * 1024  # 1MB chunk size for video streaming
@@ -598,12 +611,15 @@ def render_clip_route(
     id: str,
     force: bool = False,
     wait: bool = False,
+    _user: dict[str, Any] = Depends(require_youtube_import_user),
 ):
     """
     Render a Studio/Supabase clip onto this host as clips/{id}/clip.mp4.
 
     Studio inserts the metadata row first; call this so the file is ready to
     download. By default runs in a background thread (returns immediately).
+
+    Requires YouTube-import operator auth (JWT + allowlisted email).
 
     Query params:
       force=false  — re-render even if clip.mp4 already exists
@@ -786,10 +802,13 @@ def trigger_poll_now():
 def update_discovery_queue(
     process: bool = True,
     max_runs: int = 1,
+    _user: dict[str, Any] = Depends(require_youtube_import_user),
 ):
     """
     Cron-friendly: fetch DJ sets into discovery_runs, then optionally run the
     discovery worker (Ollama + GPU preview / approvals) on this host.
+
+    Requires YouTube-import operator auth.
 
     Query params:
       process=true|false  (default true)
@@ -824,7 +843,9 @@ def _api_public_base() -> str:
 
 
 @app.get("/api/review/candidates", tags=["Review"])
-def review_list_candidates():
+def review_list_candidates(
+    _user: dict[str, Any] = Depends(require_youtube_import_user),
+):
     """List discovery candidates awaiting review, plus recent dual-render ready clips."""
     from db import get_supabase, is_configured
     from discovery.candidates import list_candidates, public_candidate
@@ -880,7 +901,10 @@ def review_list_candidates():
 
 
 @app.get("/api/review/{candidate_id}", tags=["Review"])
-def review_get_candidate(candidate_id: str):
+def review_get_candidate(
+    candidate_id: str,
+    _user: dict[str, Any] = Depends(require_youtube_import_user),
+):
     """Fetch one candidate (for post-approve status polling)."""
     from db import get_supabase, is_configured
     from discovery.candidates import get_candidate, public_candidate
@@ -899,7 +923,12 @@ def review_get_candidate(candidate_id: str):
 
 @app.get("/api/review/{candidate_id}/preview", tags=["Review"])
 def review_preview_video(candidate_id: str):
-    """Stream the cheap preview MP4 for a discovery candidate."""
+    """
+    Stream the cheap preview MP4 for a discovery candidate.
+
+    Intentionally unauthenticated for <video src> playback (no Bearer header).
+    Candidate listing / approve / decline remain operator-gated; IDs are not enumerated publicly.
+    """
     from discovery.candidates import discovery_preview_path, get_candidate
     from db import get_supabase, is_configured
 
@@ -924,7 +953,11 @@ def review_preview_video(candidate_id: str):
 
 
 @app.post("/api/review/rebuild-previews", tags=["Review"])
-def review_rebuild_previews(limit: int = 50, status: str = "awaiting_review"):
+def review_rebuild_previews(
+    limit: int = 50,
+    status: str = "awaiting_review",
+    _user: dict[str, Any] = Depends(require_youtube_import_user),
+):
     """
     Re-render preview MP4s for the review deck without burned-in YouTube set titles.
     Run once after deploying preview render changes, or when old previews still show venue text.
@@ -992,7 +1025,10 @@ async def upload_review_preview(
 
 
 @app.post("/api/review/{candidate_id}/approve", tags=["Review"])
-def review_approve(candidate_id: str):
+def review_approve(
+    candidate_id: str,
+    _user: dict[str, Any] = Depends(require_youtube_import_user),
+):
     """Approve a preview and start full render on this host immediately."""
     import threading
 
@@ -1041,6 +1077,7 @@ def review_approve(candidate_id: str):
 def review_decline(
     candidate_id: str,
     payload: dict[str, Any] | None = Body(default=None),
+    _user: dict[str, Any] = Depends(require_youtube_import_user),
 ):
     """Decline a preview (clip_bad or caption_bad)."""
     from db import get_supabase, is_configured
@@ -1075,10 +1112,15 @@ def review_decline(
 
 
 @app.post("/api/studio/comments", tags=["Studio"])
-def studio_scan_comments(payload: dict[str, Any] | None = Body(default=None)):
+def studio_scan_comments(
+    payload: dict[str, Any] | None = Body(default=None),
+    _user: dict[str, Any] = Depends(require_youtube_import_user),
+):
     """
     Manual Clip Studio: scrape timestamped YouTube comments for a URL and return
     clip-moment candidates (clustered by default, same logic as discovery).
+
+    Requires YouTube-import operator auth.
     """
     body = payload or {}
     url = str(body.get("url") or "").strip()
@@ -1132,10 +1174,15 @@ def studio_scan_comments(payload: dict[str, Any] | None = Body(default=None)):
 
 
 @app.post("/api/studio/caption", tags=["Studio"])
-def studio_generate_caption(payload: dict[str, Any] | None = Body(default=None)):
+def studio_generate_caption(
+    payload: dict[str, Any] | None = Body(default=None),
+    _user: dict[str, Any] = Depends(require_youtube_import_user),
+):
     """
     Manual Clip Studio: rewrite a fan comment (plus optional nearby comments)
     into a social caption via Ollama on this host.
+
+    Requires YouTube-import operator auth.
 
     Optional ``custom_prompt`` / ``caption_prompt`` overrides the default voice
     (also auto-loaded from the first active template when omitted).
@@ -1202,18 +1249,33 @@ def studio_generate_caption(payload: dict[str, Any] | None = Body(default=None))
 # ---------------------------------------------------------------------------
 
 
-@app.get("/api/projects", tags=["Projects"])
-def api_list_projects():
-    from projects_store import list_projects
+def _request_owner_id(
+    owner_id: Optional[str] = None,
+    x_braindance_owner_id: Optional[str] = Header(default=None, alias="X-Braindance-Owner-Id"),
+) -> Optional[str]:
+    return (owner_id or x_braindance_owner_id or "").strip() or None
 
-    return {"success": True, "projects": list_projects()}
+
+@app.get("/api/projects", tags=["Projects"])
+def api_list_projects(
+    owner_id: Optional[str] = None,
+    x_braindance_owner_id: Optional[str] = Header(default=None, alias="X-Braindance-Owner-Id"),
+):
+    from projects_store import filter_projects_for_owner, list_projects
+
+    oid = _request_owner_id(owner_id, x_braindance_owner_id)
+    return {"success": True, "projects": filter_projects_for_owner(list_projects(), oid)}
 
 
 @app.post("/api/projects", tags=["Projects"])
-def api_create_project(payload: dict[str, Any] | None = Body(default=None)):
+def api_create_project(
+    payload: dict[str, Any] | None = Body(default=None),
+    x_braindance_owner_id: Optional[str] = Header(default=None, alias="X-Braindance-Owner-Id"),
+):
     from projects_store import create_project
 
     body = payload or {}
+    oid = _request_owner_id(str(body.get("owner_id") or "") or None, x_braindance_owner_id)
     try:
         project = create_project(
             name=str(body.get("name") or "").strip() or None,
@@ -1222,6 +1284,7 @@ def api_create_project(payload: dict[str, Any] | None = Body(default=None)):
             copy_clip=bool(body.get("copy_clip", True)),
             timeline=body.get("timeline") if isinstance(body.get("timeline"), dict) else None,
             asset_name=str(body.get("asset_name") or "").strip() or None,
+            owner_id=oid,
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
@@ -1233,40 +1296,60 @@ def api_create_project(payload: dict[str, Any] | None = Body(default=None)):
 
 
 @app.get("/api/projects/{project_id}", tags=["Projects"])
-def api_get_project(project_id: str):
-    from projects_store import load_project
+def api_get_project(
+    project_id: str,
+    x_braindance_owner_id: Optional[str] = Header(default=None, alias="X-Braindance-Owner-Id"),
+):
+    from projects_store import assert_project_access, load_project
 
     try:
         project = load_project(project_id)
+        assert_project_access(project, _request_owner_id(None, x_braindance_owner_id))
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"success": True, "project": project}
 
 
 @app.patch("/api/projects/{project_id}", tags=["Projects"])
-def api_patch_project(project_id: str, payload: dict[str, Any] | None = Body(default=None)):
-    from projects_store import update_project
+def api_patch_project(
+    project_id: str,
+    payload: dict[str, Any] | None = Body(default=None),
+    x_braindance_owner_id: Optional[str] = Header(default=None, alias="X-Braindance-Owner-Id"),
+):
+    from projects_store import assert_project_access, load_project, update_project
 
     body = payload or {}
+    oid = _request_owner_id(None, x_braindance_owner_id)
     try:
+        assert_project_access(load_project(project_id), oid)
         project = update_project(project_id, body)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"success": True, "project": project}
 
 
 @app.delete("/api/projects/{project_id}", tags=["Projects"])
-def api_delete_project(project_id: str):
-    from projects_store import delete_project
+def api_delete_project(
+    project_id: str,
+    x_braindance_owner_id: Optional[str] = Header(default=None, alias="X-Braindance-Owner-Id"),
+):
+    from projects_store import assert_project_access, delete_project, load_project
 
     try:
+        assert_project_access(load_project(project_id), _request_owner_id(None, x_braindance_owner_id))
         delete_project(project_id)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"success": True}
@@ -1349,13 +1432,21 @@ def api_stream_project_asset(project_id: str, asset_id: str):
 
 
 @app.get("/api/templates", tags=["Templates"])
-def get_templates_status():
+def get_templates_status(
+    x_braindance_owner_id: Optional[str] = Header(default=None, alias="X-Braindance-Owner-Id"),
+):
     """List Discover templates (multi-template library)."""
-    from templates.loader import list_templates, load_template_config, templates_dir
+    from templates.loader import (
+        filter_templates_for_owner,
+        list_templates,
+        load_template_config,
+        templates_dir,
+    )
 
     try:
         cfg = load_template_config()
-        templates = list_templates()
+        oid = _request_owner_id(None, x_braindance_owner_id)
+        templates = filter_templates_for_owner(list_templates(), oid)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -1378,15 +1469,20 @@ def get_templates_status():
 
 
 @app.post("/api/templates", tags=["Templates"])
-def create_template_entry(payload: dict[str, Any] | None = Body(default=None)):
+def create_template_entry(
+    payload: dict[str, Any] | None = Body(default=None),
+    x_braindance_owner_id: Optional[str] = Header(default=None, alias="X-Braindance-Owner-Id"),
+):
     """Create an empty template shell (then edit in the template editor)."""
     from templates.loader import create_template
 
     body = payload or {}
+    oid = _request_owner_id(str(body.get("owner_id") or "") or None, x_braindance_owner_id)
     try:
         row = create_template(
             name=str(body.get("name") or "").strip() or None,
             project_id=str(body.get("project_id") or "").strip() or None,
+            owner_id=oid,
         )
         return {"success": True, "template": row}
     except Exception as e:
@@ -1394,21 +1490,38 @@ def create_template_entry(payload: dict[str, Any] | None = Body(default=None)):
 
 
 @app.get("/api/templates/{template_id}", tags=["Templates"])
-def get_template_entry(template_id: str):
-    from templates.loader import get_template
+def get_template_entry(
+    template_id: str,
+    x_braindance_owner_id: Optional[str] = Header(default=None, alias="X-Braindance-Owner-Id"),
+):
+    from templates.loader import assert_template_access, get_template
 
     row = get_template(template_id)
     if not row:
         raise HTTPException(status_code=404, detail="Template not found")
+    try:
+        assert_template_access(row, _request_owner_id(None, x_braindance_owner_id))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
     return {"success": True, "template": row}
 
 
 @app.patch("/api/templates/{template_id}", tags=["Templates"])
-def patch_template_entry(template_id: str, payload: dict[str, Any] | None = Body(default=None)):
-    from templates.loader import get_template, update_template
+def patch_template_entry(
+    template_id: str,
+    payload: dict[str, Any] | None = Body(default=None),
+    x_braindance_owner_id: Optional[str] = Header(default=None, alias="X-Braindance-Owner-Id"),
+):
+    from templates.loader import assert_template_access, get_template, update_template
 
-    if not get_template(template_id):
+    row = get_template(template_id)
+    if not row:
         raise HTTPException(status_code=404, detail="Template not found")
+    oid = _request_owner_id(None, x_braindance_owner_id)
+    try:
+        assert_template_access(row, oid)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
     body = payload or {}
     try:
         caption_prompt_arg: str | None = None
@@ -1425,6 +1538,7 @@ def patch_template_entry(template_id: str, payload: dict[str, Any] | None = Body
             project_id=body["project_id"] if "project_id" in body else None,
             active=body["active"] if "active" in body else None,
             caption_prompt=caption_prompt_arg,
+            owner_id=body["owner_id"] if "owner_id" in body else None,
         )
         return {"success": True, "template": row}
     except Exception as e:
@@ -1432,13 +1546,48 @@ def patch_template_entry(template_id: str, payload: dict[str, Any] | None = Body
 
 
 @app.delete("/api/templates/{template_id}", tags=["Templates"])
-def delete_template_entry(template_id: str):
-    from templates.loader import delete_template, get_template
+def delete_template_entry(
+    template_id: str,
+    x_braindance_owner_id: Optional[str] = Header(default=None, alias="X-Braindance-Owner-Id"),
+):
+    from templates.loader import assert_template_access, delete_template, get_template
 
-    if not get_template(template_id):
+    row = get_template(template_id)
+    if not row:
         raise HTTPException(status_code=404, detail="Template not found")
+    try:
+        assert_template_access(row, _request_owner_id(None, x_braindance_owner_id))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
     delete_template(template_id)
     return {"success": True}
+
+
+@app.get("/api/templates/{template_id}/intro", tags=["Templates"])
+def get_named_template_intro(template_id: str):
+    """Stream the saved intro bumper for a template (if present)."""
+    from templates.loader import get_template, template_dir, template_intro_path
+
+    row = get_template(template_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Template not found")
+    path = template_intro_path(template_id)
+    if not path.is_file() or path.stat().st_size < 1000:
+        # Hydrate bumper from Supabase Storage / DB when the local cache was wiped.
+        try:
+            from cloud_store import hydrate_template_to_disk
+
+            hydrate_template_to_disk(template_id, template_dir(template_id))
+        except Exception as exc:
+            print(f"  [templates] intro hydrate failed: {exc}")
+    if not path.is_file() or path.stat().st_size < 1000:
+        raise HTTPException(status_code=404, detail="Template has no saved intro bumper")
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        filename=f"{template_id}_intro.mp4",
+        headers={"Cache-Control": "private, max-age=60"},
+    )
 
 
 @app.post("/api/templates/{template_id}/intro", tags=["Templates"])
@@ -1569,10 +1718,13 @@ async def convert_media_to_mp3(
 
 
 @app.get("/api/connections", tags=["Connections"])
-def list_connections():
+def list_connections(
+    _user: dict[str, Any] = Depends(require_youtube_import_user),
+):
     """
     Show which social platforms have credentials stored on this poster host.
     The background worker uses these to auto-post queued clips.
+    Operator-only (YouTube-import allowlist).
     """
     from connections import get_connections_status
 
@@ -1580,7 +1732,10 @@ def list_connections():
 
 
 @app.post("/api/connections/{platform}/connect", tags=["Connections"])
-def connect_platform(platform: str):
+def connect_platform(
+    platform: str,
+    _user: dict[str, Any] = Depends(require_youtube_import_user),
+):
     """
     Start interactive login for youtube | instagram | tiktok on the poster host.
     Opens a browser on this machine; poll GET /api/connections until connected.
@@ -1595,7 +1750,10 @@ def connect_platform(platform: str):
 
 @app.delete("/api/connections/{platform}", tags=["Connections"])
 @app.post("/api/connections/{platform}/disconnect", tags=["Connections"])
-def disconnect_platform_route(platform: str):
+def disconnect_platform_route(
+    platform: str,
+    _user: dict[str, Any] = Depends(require_youtube_import_user),
+):
     """Remove stored credentials for a platform on this poster host."""
     from connections import disconnect_platform
 

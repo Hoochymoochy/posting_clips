@@ -63,6 +63,7 @@ def _default_project(project_id: str, name: str = "Untitled project") -> dict[st
         "name": name or "Untitled project",
         "description": "",
         "source_clip_id": None,
+        "owner_id": None,
         "created_at": now,
         "updated_at": now,
         "assets": [],
@@ -120,7 +121,10 @@ def load_project(project_id: str) -> dict[str, Any]:
         except Exception as exc:
             print(f"  [projects] cloud hydrate failed: {exc}")
     if not path.is_file():
-        raise FileNotFoundError(f"Project {project_id} not found")
+        raise FileNotFoundError(
+            f"Project folder missing (id {project_id}). "
+            "It may have been deleted — open the template again to create a fresh project."
+        )
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError("Invalid project.json")
@@ -175,6 +179,7 @@ def list_projects() -> list[dict[str, Any]]:
                 "name": data.get("name") or "Untitled project",
                 "description": data.get("description") or "",
                 "source_clip_id": data.get("source_clip_id"),
+                "owner_id": data.get("owner_id"),
                 "created_at": data.get("created_at"),
                 "updated_at": data.get("updated_at"),
                 "asset_count": len(assets) if isinstance(assets, list) else 0,
@@ -196,6 +201,7 @@ def list_projects() -> list[dict[str, Any]]:
                 "name": data.get("name") or "Untitled project",
                 "description": data.get("description") or "",
                 "source_clip_id": data.get("source_clip_id"),
+                "owner_id": data.get("owner_id"),
                 "created_at": data.get("created_at"),
                 "updated_at": data.get("updated_at"),
                 "asset_count": len(assets) if isinstance(assets, list) else 0,
@@ -208,6 +214,32 @@ def list_projects() -> list[dict[str, Any]]:
     return items
 
 
+def filter_projects_for_owner(
+    items: list[dict[str, Any]], owner_id: str | None
+) -> list[dict[str, Any]]:
+    """
+    When owner_id is set, return that creator's projects plus legacy unowned rows
+    (single-tenant back-compat). When owner_id is None, return everything.
+    """
+    if not owner_id:
+        return items
+    oid = str(owner_id).strip()
+    return [
+        row
+        for row in items
+        if not row.get("owner_id") or str(row.get("owner_id")) == oid
+    ]
+
+
+def assert_project_access(project: dict[str, Any], owner_id: str | None) -> None:
+    """Raise PermissionError if a signed-in owner cannot access this project."""
+    if not owner_id:
+        return
+    existing = str(project.get("owner_id") or "").strip()
+    if existing and existing != str(owner_id).strip():
+        raise PermissionError("Project belongs to another creator")
+
+
 def create_project(
     *,
     name: str | None = None,
@@ -216,11 +248,14 @@ def create_project(
     copy_clip: bool = True,
     timeline: dict[str, Any] | None = None,
     asset_name: str | None = None,
+    owner_id: str | None = None,
 ) -> dict[str, Any]:
     project_id = uuid.uuid4().hex
     data = _default_project(project_id, name or "Untitled project")
     if description is not None:
         data["description"] = str(description)
+    if owner_id:
+        data["owner_id"] = str(owner_id).strip() or None
     if timeline:
         data["timeline"] = {**data["timeline"], **timeline}
 
@@ -259,6 +294,9 @@ def update_project(project_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         data["name"] = str(patch["name"]).strip() or data["name"]
     if "description" in patch and patch["description"] is not None:
         data["description"] = str(patch["description"])
+    if "owner_id" in patch:
+        raw = patch.get("owner_id")
+        data["owner_id"] = str(raw).strip() if raw else None
     if "timeline" in patch and isinstance(patch["timeline"], dict):
         data["timeline"] = patch["timeline"]
     if "assets" in patch and isinstance(patch["assets"], list):

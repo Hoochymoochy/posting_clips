@@ -1,0 +1,15 @@
+-- Braindance Studio — creator isolation notes
+--
+-- Templates store owner_id in public.templates (and disk/Storage mirrors).
+-- Projects still store optional owner_id in JSON (disk + Storage).
+-- Filtering is enforced by the poster API via X-Braindance-Owner-Id after
+-- the Next.js layer verifies a Supabase JWT.
+--
+-- Future shared auth with braindance.live can continue using the same
+-- Supabase Auth user ids. When ready, add RLS policies on public.templates
+-- (and any new tables) that reference owner_id uuid = auth.uid().
+--
+-- Per-creator publishing credentials live under creator_credentials/{owner_id}.json
+-- on the poster host (see creator_credentials.py). Do not store Playwright
+-- session cookies there for the public product.
+SELECT 1;

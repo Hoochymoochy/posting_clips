@@ -136,10 +136,27 @@ def _read_meta(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def _enrich_bumper_fields(template_id: str, meta: dict[str, Any]) -> dict[str, Any]:
+    """Attach has_bumper / intro_bytes / storage path from local intro.mp4 when present."""
+    payload = dict(meta)
+    tid = _safe_id(template_id)
+    intro = template_intro_path(tid)
+    if intro.is_file() and intro.stat().st_size > 1000:
+        size = intro.stat().st_size
+        payload["has_bumper"] = True
+        payload["intro_bytes"] = size
+        payload["intro_storage_path"] = f"templates/{tid}/intro.mp4"
+    else:
+        # Keep explicit DB/cloud flags when the local cache is empty.
+        payload.setdefault("has_bumper", bool(payload.get("has_bumper", False)))
+        payload.setdefault("intro_bytes", int(payload.get("intro_bytes") or 0))
+    return payload
+
+
 def _write_meta(template_id: str, meta: dict[str, Any]) -> dict[str, Any]:
     folder = template_dir(template_id)
     folder.mkdir(parents=True, exist_ok=True)
-    payload = dict(meta)
+    payload = _enrich_bumper_fields(template_id, meta)
     payload["id"] = _safe_id(template_id)
     payload["updated_at"] = _now_iso()
     if not payload.get("created_at"):
@@ -160,22 +177,33 @@ def _public_template(meta: dict[str, Any]) -> dict[str, Any]:
     tid = str(meta.get("id") or "")
     intro = template_intro_path(tid)
     project_id = str(meta.get("project_id") or "").strip() or None
-    has_intro = intro.is_file() and intro.stat().st_size > 20_000
+    disk_intro = intro.is_file() and intro.stat().st_size > 20_000
+    meta_bumper = bool(meta.get("has_bumper")) or int(meta.get("intro_bytes") or 0) > 20_000
+    has_intro = disk_intro or meta_bumper
     # Hook-only templates (no bumper) are ready once a project is bound.
     ready = has_intro or bool(project_id)
     caption_prompt = str(meta.get("caption_prompt") or "").strip() or None
-    return {
+    intro_bytes = (
+        intro.stat().st_size
+        if intro.is_file()
+        else int(meta.get("intro_bytes") or 0)
+    )
+    out = {
         "id": tid,
         "name": str(meta.get("name") or "Untitled template"),
         "project_id": project_id,
+        "owner_id": str(meta.get("owner_id") or "").strip() or None,
         "active": bool(meta.get("active", True)),
         "ready": ready,
         "has_bumper": has_intro,
-        "intro_bytes": intro.stat().st_size if intro.is_file() else 0,
+        "intro_bytes": intro_bytes,
         "caption_prompt": caption_prompt,
         "created_at": meta.get("created_at"),
         "updated_at": meta.get("updated_at"),
     }
+    if isinstance(meta.get("layout"), dict):
+        out["has_layout"] = True
+    return out
 
 
 def migrate_legacy_template() -> dict[str, Any] | None:
@@ -231,25 +259,57 @@ def migrate_legacy_template() -> dict[str, Any] | None:
 
 def list_templates() -> list[dict[str, Any]]:
     migrate_legacy_template()
-    # Pull any templates that only exist in Supabase onto this host.
+    by_id: dict[str, dict[str, Any]] = {}
+
+    # 1) Postgres is the tracking source of truth.
     try:
-        from cloud_store import hydrate_template_to_disk, list_cloud_template_ids
+        from cloud_store import hydrate_template_to_disk, list_template_db_rows
 
-        local_ids = {p.name for p in library_dir().iterdir() if p.is_dir()}
-        for tid in list_cloud_template_ids():
-            if tid not in local_ids:
-                hydrate_template_to_disk(tid, template_dir(tid))
+        for meta in list_template_db_rows():
+            tid = str(meta.get("id") or "").strip()
+            if not tid:
+                continue
+            # Ensure local cache (meta + intro) exists for render/edit.
+            disk_meta = _read_meta(template_meta_path(tid))
+            intro = template_intro_path(tid)
+            needs_hydrate = not disk_meta or (
+                bool(meta.get("has_bumper"))
+                and (not intro.is_file() or intro.stat().st_size < 1000)
+            )
+            if needs_hydrate:
+                try:
+                    hydrate_template_to_disk(tid, template_dir(tid))
+                except Exception as exc:
+                    print(f"  [templates] hydrate {tid}: {exc}")
+            # Prefer freshest disk meta when present (local edits), else DB row.
+            merged = disk_meta or meta
+            if disk_meta and meta:
+                merged = dict(meta)
+                merged.update(disk_meta)
+                # DB bumper flags win when disk cache was wiped.
+                if meta.get("has_bumper") and not merged.get("has_bumper"):
+                    merged["has_bumper"] = True
+                    merged["intro_bytes"] = meta.get("intro_bytes") or 0
+                    merged["intro_storage_path"] = meta.get("intro_storage_path")
+                if isinstance(meta.get("layout"), dict) and "layout" not in merged:
+                    merged["layout"] = meta["layout"]
+            by_id[tid] = _public_template(merged)
+            # Push any disk-only fields back so DB stays current.
+            if disk_meta and (
+                not meta.get("has_bumper")
+                and (intro.is_file() and intro.stat().st_size > 20_000)
+            ):
+                _write_meta(tid, disk_meta)
     except Exception as exc:
-        print(f"  [templates] cloud list hydrate failed: {exc}")
+        print(f"  [templates] db list failed: {exc}")
 
-    rows: list[dict[str, Any]] = []
+    # 2) Disk folders not yet in DB (legacy / offline) — upsert them.
     root = library_dir()
     for child in sorted(root.iterdir(), key=lambda p: p.name):
-        if not child.is_dir():
+        if not child.is_dir() or child.name in by_id:
             continue
         meta = _read_meta(child / "meta.json")
         if not meta:
-            # Recover folders that only have intro.mp4
             intro = child / "intro.mp4"
             if intro.is_file():
                 meta = _write_meta(
@@ -262,7 +322,12 @@ def list_templates() -> list[dict[str, Any]]:
                 )
             else:
                 continue
-        rows.append(_public_template(meta))
+        else:
+            # First time this host sees DB — persist disk row.
+            meta = _write_meta(child.name, meta)
+        by_id[child.name] = _public_template(meta)
+
+    rows = list(by_id.values())
     rows.sort(key=lambda r: str(r.get("updated_at") or ""), reverse=True)
     return rows
 
@@ -278,6 +343,14 @@ def get_template(template_id: str) -> dict[str, Any] | None:
             meta = hydrate_template_to_disk(tid, template_dir(tid))
         except Exception as exc:
             print(f"  [templates] cloud hydrate failed: {exc}")
+            meta = None
+    if not meta:
+        try:
+            from cloud_store import fetch_template_db
+
+            meta = fetch_template_db(tid)
+        except Exception as exc:
+            print(f"  [templates] db fetch failed: {exc}")
             meta = None
     if not meta:
         return None
@@ -307,7 +380,12 @@ def ensure_template(
     return _public_template(meta)
 
 
-def create_template(*, name: str | None = None, project_id: str | None = None) -> dict[str, Any]:
+def create_template(
+    *,
+    name: str | None = None,
+    project_id: str | None = None,
+    owner_id: str | None = None,
+) -> dict[str, Any]:
     migrate_legacy_template()
     tid = uuid.uuid4().hex[:12]
     label = (name or "").strip() or f"Template {len(list_templates()) + 1}"
@@ -317,10 +395,73 @@ def create_template(*, name: str | None = None, project_id: str | None = None) -
             "id": tid,
             "name": label,
             "project_id": (project_id or "").strip() or None,
+            "owner_id": (owner_id or "").strip() or None,
             "active": True,
         },
     )
     return _public_template(meta)
+
+
+def filter_templates_for_owner(
+    items: list[dict[str, Any]], owner_id: str | None
+) -> list[dict[str, Any]]:
+    if not owner_id:
+        return items
+    oid = str(owner_id).strip()
+    return [
+        row
+        for row in items
+        if not row.get("owner_id") or str(row.get("owner_id")) == oid
+    ]
+
+
+def assert_template_access(template: dict[str, Any], owner_id: str | None) -> None:
+    if not owner_id:
+        return
+    existing = str(template.get("owner_id") or "").strip()
+    if existing and existing != str(owner_id).strip():
+        raise PermissionError("Template belongs to another creator")
+
+
+def snapshot_layout_from_project(project_id: str | None) -> dict[str, Any] | None:
+    """Pull a compact editor layout snapshot from a bound project (for DB recovery)."""
+    pid = (project_id or "").strip()
+    if not pid:
+        return None
+    try:
+        from projects_store import load_project
+
+        project = load_project(pid)
+    except Exception:
+        return None
+    timeline = project.get("timeline") if isinstance(project.get("timeline"), dict) else {}
+    assets = project.get("assets") if isinstance(project.get("assets"), list) else []
+    return {
+        "name": project.get("name"),
+        "timeline": {
+            "laneCount": timeline.get("laneCount"),
+            "audioLaneCount": timeline.get("audioLaneCount"),
+            "clips": timeline.get("clips") or [],
+            "captions": timeline.get("captions") or [],
+            "hookFont": timeline.get("hookFont"),
+            "hookStyle": timeline.get("hookStyle"),
+            "hookFontSize": timeline.get("hookFontSize"),
+            "hookTextY": timeline.get("hookTextY"),
+        },
+        "assets": [
+            {
+                "id": a.get("id"),
+                "name": a.get("name"),
+                "filename": a.get("filename"),
+                "duration": a.get("duration"),
+                "kind": a.get("kind"),
+                "templateSlot": a.get("templateSlot"),
+            }
+            for a in assets
+            if isinstance(a, dict)
+        ],
+        "snapshotted_at": _now_iso(),
+    }
 
 
 def update_template(
@@ -330,9 +471,19 @@ def update_template(
     project_id: str | None = None,
     active: bool | None = None,
     caption_prompt: str | None = None,
+    owner_id: str | None = None,
+    layout: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     tid = _safe_id(template_id)
-    meta = _read_meta(template_meta_path(tid)) or {
+    meta = _read_meta(template_meta_path(tid))
+    if not meta:
+        try:
+            from cloud_store import fetch_template_meta
+
+            meta = fetch_template_meta(tid)
+        except Exception:
+            meta = None
+    meta = meta or {
         "id": tid,
         "name": tid,
         "active": True,
@@ -343,11 +494,19 @@ def update_template(
             meta["name"] = clean
     if project_id is not None:
         meta["project_id"] = project_id.strip() or None
+        # Refresh layout snapshot whenever the bound project changes.
+        snap = snapshot_layout_from_project(meta.get("project_id"))
+        if snap:
+            meta["layout"] = snap
     if active is not None:
         meta["active"] = bool(active)
     if caption_prompt is not None:
         # Empty string clears the custom prompt (falls back to default Ollama voice).
         meta["caption_prompt"] = caption_prompt.strip() or None
+    if owner_id is not None:
+        meta["owner_id"] = owner_id.strip() or None
+    if layout is not None:
+        meta["layout"] = layout if isinstance(layout, dict) else None
     saved = _write_meta(tid, meta)
     return _public_template(saved)
 
@@ -390,7 +549,15 @@ def save_template_intro(
     dest = template_intro_path(tid)
     shutil.copy2(source_path, dest)
 
-    meta = _read_meta(template_meta_path(tid)) or {
+    meta = _read_meta(template_meta_path(tid))
+    if not meta:
+        try:
+            from cloud_store import fetch_template_meta
+
+            meta = fetch_template_meta(tid)
+        except Exception:
+            meta = None
+    meta = meta or {
         "id": tid,
         "name": name or tid,
         "active": True,
@@ -399,6 +566,12 @@ def save_template_intro(
         meta["name"] = name.strip()
     if project_id is not None:
         meta["project_id"] = project_id.strip() or None
+    meta["has_bumper"] = True
+    meta["intro_bytes"] = dest.stat().st_size if dest.is_file() else 0
+    meta["intro_storage_path"] = f"templates/{tid}/intro.mp4"
+    snap = snapshot_layout_from_project(meta.get("project_id"))
+    if snap:
+        meta["layout"] = snap
     saved = _write_meta(tid, meta)
 
     try:

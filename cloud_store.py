@@ -208,25 +208,147 @@ def delete_cloud_project(project_id: str) -> None:
     _remove(paths)
 
 
-# --- templates ----------------------------------------------------------------
+# --- templates (Postgres + Storage) -------------------------------------------
+
+
+def _intro_storage_path(template_id: str) -> str:
+    return f"templates/{template_id}/intro.mp4"
+
+
+def _row_from_db(row: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a public.templates row into the meta shape used on disk."""
+    tid = str(row.get("id") or "").strip()
+    meta: dict[str, Any] = {
+        "id": tid,
+        "name": str(row.get("name") or "Untitled template"),
+        "project_id": str(row.get("project_id") or "").strip() or None,
+        "owner_id": str(row.get("owner_id") or "").strip() or None,
+        "active": bool(row.get("active", True)),
+        "caption_prompt": str(row.get("caption_prompt") or "").strip() or None,
+        "has_bumper": bool(row.get("has_bumper", False)),
+        "intro_bytes": int(row.get("intro_bytes") or 0),
+        "intro_storage_path": str(row.get("intro_storage_path") or "").strip()
+        or (_intro_storage_path(tid) if row.get("has_bumper") else None),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+    }
+    layout = row.get("layout")
+    if isinstance(layout, dict):
+        meta["layout"] = layout
+    return meta
+
+
+def upsert_template_db(meta: dict[str, Any]) -> bool:
+    """Upsert template metadata into public.templates (source of truth)."""
+    sb = _client()
+    tid = str(meta.get("id") or "").strip()
+    if sb is None or not tid:
+        return False
+    has_bumper = bool(meta.get("has_bumper", False))
+    intro_bytes = int(meta.get("intro_bytes") or 0)
+    storage_path = str(meta.get("intro_storage_path") or "").strip() or None
+    if has_bumper and not storage_path:
+        storage_path = _intro_storage_path(tid)
+    payload: dict[str, Any] = {
+        "id": tid,
+        "name": str(meta.get("name") or "Untitled template"),
+        "project_id": str(meta.get("project_id") or "").strip() or None,
+        "owner_id": str(meta.get("owner_id") or "").strip() or None,
+        "active": bool(meta.get("active", True)),
+        "caption_prompt": str(meta.get("caption_prompt") or "").strip() or None,
+        "has_bumper": has_bumper,
+        "intro_bytes": intro_bytes,
+        "intro_storage_path": storage_path,
+    }
+    if "layout" in meta:
+        layout = meta.get("layout")
+        payload["layout"] = layout if isinstance(layout, dict) else None
+    # Preserve created_at on first insert when provided.
+    if meta.get("created_at"):
+        payload["created_at"] = meta["created_at"]
+    try:
+        sb.table("templates").upsert(payload, on_conflict="id").execute()
+        return True
+    except Exception as exc:
+        print(f"  [cloud] templates db upsert {tid}: {exc}")
+        return False
+
+
+def fetch_template_db(template_id: str) -> dict[str, Any] | None:
+    sb = _client()
+    tid = str(template_id or "").strip()
+    if sb is None or not tid:
+        return None
+    try:
+        res = sb.table("templates").select("*").eq("id", tid).limit(1).execute()
+        rows = res.data or []
+        if not rows:
+            return None
+        return _row_from_db(rows[0])
+    except Exception as exc:
+        print(f"  [cloud] templates db fetch {tid}: {exc}")
+        return None
+
+
+def list_template_db_rows() -> list[dict[str, Any]]:
+    sb = _client()
+    if sb is None:
+        return []
+    try:
+        res = (
+            sb.table("templates")
+            .select("*")
+            .order("updated_at", desc=True)
+            .execute()
+        )
+        return [_row_from_db(r) for r in (res.data or []) if isinstance(r, dict)]
+    except Exception as exc:
+        print(f"  [cloud] templates db list: {exc}")
+        return []
+
+
+def delete_template_db(template_id: str) -> None:
+    sb = _client()
+    tid = str(template_id or "").strip()
+    if sb is None or not tid:
+        return
+    try:
+        sb.table("templates").delete().eq("id", tid).execute()
+    except Exception as exc:
+        print(f"  [cloud] templates db delete {tid}: {exc}")
 
 
 def upsert_template_meta(meta: dict[str, Any]) -> bool:
+    """Write template meta to Postgres + Storage JSON mirror."""
     tid = str(meta.get("id") or "").strip()
     if not tid:
         return False
+    db_ok = upsert_template_db(meta)
     payload = json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8")
-    return _upload(f"templates/{tid}/meta.json", payload, "application/json")
+    storage_ok = _upload(f"templates/{tid}/meta.json", payload, "application/json")
+    return db_ok or storage_ok
 
 
 def upload_template_intro(template_id: str, intro_path: Path) -> bool:
     tid = str(template_id or "").strip()
     if not tid or not intro_path.is_file():
         return False
-    return _upload(f"templates/{tid}/intro.mp4", intro_path.read_bytes(), "video/mp4")
+    ok = _upload(_intro_storage_path(tid), intro_path.read_bytes(), "video/mp4")
+    if ok:
+        # Keep DB bumper flags in sync even if caller only uploaded bytes.
+        existing = fetch_template_db(tid) or {"id": tid, "name": tid, "active": True}
+        existing["has_bumper"] = True
+        existing["intro_bytes"] = intro_path.stat().st_size
+        existing["intro_storage_path"] = _intro_storage_path(tid)
+        upsert_template_db(existing)
+    return ok
 
 
 def fetch_template_meta(template_id: str) -> dict[str, Any] | None:
+    """Prefer Postgres; fall back to Storage meta.json."""
+    db = fetch_template_db(template_id)
+    if db:
+        return db
     raw = _download(f"templates/{template_id}/meta.json")
     if not raw:
         return None
@@ -234,7 +356,11 @@ def fetch_template_meta(template_id: str) -> dict[str, Any] | None:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None
-    return data if isinstance(data, dict) else None
+    if isinstance(data, dict):
+        # Backfill DB when we only had Storage.
+        upsert_template_db(data)
+        return data
+    return None
 
 
 def hydrate_template_to_disk(template_id: str, folder: Path) -> dict[str, Any] | None:
@@ -247,19 +373,31 @@ def hydrate_template_to_disk(template_id: str, folder: Path) -> dict[str, Any] |
         encoding="utf-8",
     )
     intro = folder / "intro.mp4"
-    if not intro.is_file() or intro.stat().st_size < 1000:
-        blob = _download(f"templates/{template_id}/intro.mp4")
+    wants_bumper = bool(meta.get("has_bumper")) or (
+        int(meta.get("intro_bytes") or 0) > 1000
+    )
+    if wants_bumper and (not intro.is_file() or intro.stat().st_size < 1000):
+        storage_path = str(meta.get("intro_storage_path") or "").strip() or _intro_storage_path(
+            template_id
+        )
+        blob = _download(storage_path)
         if blob:
             intro.write_bytes(blob)
     return meta
 
 
 def list_cloud_template_ids() -> list[str]:
-    rows = _list("templates")
     ids: list[str] = []
-    for row in rows:
+    seen: set[str] = set()
+    for row in list_template_db_rows():
+        tid = str(row.get("id") or "").strip()
+        if tid and tid not in seen:
+            seen.add(tid)
+            ids.append(tid)
+    for row in _list("templates"):
         name = str(row.get("name") or "").strip()
-        if name and name not in (".", ".."):
+        if name and name not in (".", "..") and name not in seen:
+            seen.add(name)
             ids.append(name)
     return ids
 
@@ -268,4 +406,5 @@ def delete_cloud_template(template_id: str) -> None:
     tid = str(template_id or "").strip()
     if not tid:
         return
-    _remove([f"templates/{tid}/meta.json", f"templates/{tid}/intro.mp4"])
+    delete_template_db(tid)
+    _remove([f"templates/{tid}/meta.json", _intro_storage_path(tid)])
